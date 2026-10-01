@@ -20,10 +20,8 @@ def test_parse_nodes_and_prerequisites():
     # Sampled assistant nodes at trace.nodes positions 1, 3, 5, 7 (prompts/tool results in between).
     turns = [(1, 10), (3, 20), (5, 30), (7, 40)]
     raw = [{"name": "a", "node": 3}, {"name": "b", "node": 1}, {"name": "c", "node": None}, {"name": "d", "node": 7}]
-    names, boundaries = parse_stages(raw, turns, num_nodes=9)
-    assert names == ["a", "b", "c", "d"]
     # "b" cannot end before its prerequisite; "d" is unreached because "c" never completed.
-    assert boundaries == [30, 30]
+    assert parse_stages(raw, turns, num_nodes=9) == (["a", "b", "c", "d"], [30, 30])
 
 
 def test_parse_rejects_bad_turn():
@@ -32,8 +30,8 @@ def test_parse_rejects_bad_turn():
 
 
 def test_parse_token_offsets():
-    names, boundaries = parse_stages([{"name": "a", "token": 12}, {"name": "b", "token": 999}], [(1, 50)], num_nodes=2)
-    assert boundaries == [12, 50]
+    raw = [{"name": "a", "token": 12}, {"name": "b", "token": 999}]
+    assert parse_stages(raw, [(1, 50)], num_nodes=2) == (["a", "b"], [12, 50])
 
 
 def test_late_failure_keeps_early_credit():
