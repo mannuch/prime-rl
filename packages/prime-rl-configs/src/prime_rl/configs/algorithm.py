@@ -1,8 +1,8 @@
 """Algorithm abstraction: sampling and the per-token training signal.
 
 An algorithm is a named, self-contained config — a discriminated union keyed
-on ``type`` (``grpo``, ``max_rl``, ``rae``, ``hierarchical_grpo``, ``opd``,
-``opsd``, ``sft``, ``echo``, ``debug``).
+on ``type`` (``grpo``, ``max_rl``, ``rae``, ``hierarchical_grpo``,
+``temporal_grpo``, ``opd``, ``opsd``, ``sft``, ``echo``, ``debug``).
 The bundle *is* the algorithm: each variant carries
 its sampling component and its credit-assignment / loss-routing parameters,
 and its class defaults are the vetted setting — ``type = "opd"`` with a
@@ -261,6 +261,29 @@ class RAEAlgoConfig(BaseAlgoConfig):
     memory — a restart re-warms them over ~1/(1 − decay) traces per agent."""
 
 
+class TemporalGRPOAlgoConfig(BaseAlgoConfig):
+    type: Literal["temporal_grpo"] = "temporal_grpo"
+    """Temporal GRPO (arXiv:2608.13026): stage-conditioned credit. Each rollout
+    is split into ordered stage intervals read from ``trace.info[stage_key]``;
+    stage k's advantage compares only rollouts that entered stage k, and is
+    assigned only to that stage's tokens. The final stage is the task reward.
+    Groups without a consistent stage record fall back to GRPO credit."""
+
+    action_loss_type: ClassVar[ActionLossType] = "rl"
+
+    stage_key: str = "stages"
+    """Key in ``trace.info`` holding the env's ordered intermediate-stage record."""
+
+    std_normalize: bool = False
+    """Divide each stage's centered outcome by its entrants' std (the paper's setting). Off by default, matching prime-rl's GRPO."""
+
+    trajectory_weight: float = Field(0.0, ge=0.0, le=1.0)
+    """Blend in the plain trajectory advantage: (1 - w) * stage + w * (reward - group mean). 0 is the paper's rule; raise it when early-stage choices affect later-stage success."""
+
+    success_threshold: float = 1.0
+    """Reward at or above which a rollout counts as a task success — used only to reject groups whose stage record contradicts the reward."""
+
+
 class HierarchicalGRPOAlgoConfig(BaseAlgoConfig):
     type: Literal["hierarchical_grpo"] = "hierarchical_grpo"
     """GRPO for proposer-solver envs.
@@ -397,6 +420,7 @@ AlgoConfig: TypeAlias = Annotated[
     | MaxRLAlgoConfig
     | RAEAlgoConfig
     | HierarchicalGRPOAlgoConfig
+    | TemporalGRPOAlgoConfig
     | OPDAlgoConfig
     | OPSDAlgoConfig
     | SFTAlgoConfig
@@ -411,6 +435,7 @@ its class defaults are the vetted setting.
 - ``max_rl`` — GRPO with mean-normalized advantages (maximum-likelihood RL).
 - ``rae`` — reward minus a per-agent EMA baseline (SPIRAL), for multi-agent self-play envs.
 - ``hierarchical_grpo`` — GRPO for proposer-solver envs: solvers are compared within one proposed problem and proposers across proposals. Needs ``episode_agents``.
+- ``temporal_grpo`` — stage-conditioned GRPO: per-stage group comparison among rollouts that entered the stage, credit on that stage's tokens only. Needs an env that records stages in ``trace.info``.
 - ``opd`` — on-policy distillation: policy samples, per-token reverse KL against a reference model. Needs ``teacher``.
 - ``opsd`` — SDFT: policy samples, demo-conditioned reverse KL against the live policy (the teacher is the policy itself).
 - ``sft`` — a frozen model samples, the policy trains with CE on its tokens. Needs a frozen ``sampling.source``.
