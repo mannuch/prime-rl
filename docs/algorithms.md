@@ -148,6 +148,7 @@ At runtime, each env's resolved config builds two objects: a `GenerationSource` 
 | `max_rl` | `MaxRLAlgorithm` | `score_group`: mean-normalized group credit |
 | `rae` | `RAEAlgorithm` | `score_group`: per-agent EMA-baseline credit |
 | `hierarchical_grpo` | `HierarchicalGRPOAlgorithm` | `score_group`: GRPO baseline per episode for solvers, per group for the proposer |
+| `temporal_grpo` | `TemporalGRPOAlgorithm` | `score_group`: stage-conditioned credit on stage token intervals |
 | `opd` | `OPDAlgorithm` | `score_episode`: own-context prefill under the teacher |
 | `opsd` | `OPSDAlgorithm` | `score_episode`: demo-conditioned prefill under the live policy |
 | `sft` | `SFTDistillAlgorithm` | no credit assignment; CE on sampled tokens |
@@ -385,6 +386,35 @@ env.solver.runtime.type = "subprocess"
 `group_size` controls how many problems are proposed from each source task. `env.n` controls how many solvers attempt each proposed problem. If a comparison contains only one trace—for example, a solver when `env.n = 1`—its advantage is zero.
 
 This algorithm is accepted only for proposer-solver envs. Use the env's `train_proposer` and `train_solver` settings if you want to train only one role.
+
+### Temporal GRPO
+
+GRPO broadcasts one advantage over every sampled token. A rollout that clears three stages of a task and fails the fourth is penalized for the three it cleared. `temporal_grpo` ([arXiv:2608.13026](https://arxiv.org/abs/2608.13026)) splits each rollout into ordered stage intervals and compares, for each stage, only the rollouts that *entered* it (completed its prerequisite). Stage *k*'s advantage is `completed_k - mean` over its entrants and lands only on stage *k*'s tokens. The final stage is the task reward, over the tokens after the last intermediate stage, so the task objective is unchanged. A stage whose entrants all agree contributes zero; with `constant_trainer_batch_size` (on by default), those zero-advantage tokens are also pruned from the rl denominator. A group where every rollout fails the task but they diverge at an earlier stage still carries signal.
+
+The env declares progress in `trace.info["stages"]`: the task's ordered intermediate stages, each marking the `trace.nodes` index of the assistant node whose action completed it (`None` if never completed), or a `token` offset for stages inside one long response. Where to write it depends on who can see progress:
+
+- **Online, in `Env.run`** — for games and simulated-user envs, where the env steps the ground truth between turns. Right after the turn that caused the change, record the latest sampled node's index. This also catches the final move, whose observation is never sent back to the model and so never becomes a node.
+- **Offline, in `Task.finalize`** — replay the transcript: the first tool result or user turn that proves a stage is credited to the assistant turn it answers (the tool call's issuer via `tool_call_id`, or a user turn's nearest sampled ancestor).
+
+```python
+# Env.run, one move per segment
+done: list[int] = []  # node index that completed each stage, in order
+segment = await interaction.turn()
+while not segment.terminated:
+    game.step(segment.last_reply)
+    if len(done) < len(STAGES) and game.reached(STAGES[len(done)]):
+        done.append(max(i for i, n in enumerate(interaction.trace.nodes) if n.sampled))
+    ...
+interaction.trace.info["stages"] = [{"name": n, "node": done[k] if k < len(done) else None} for k, n in enumerate(STAGES)]
+```
+
+```toml
+[orchestrator.train.algo]
+type = "temporal_grpo"
+trajectory_weight = 0.0   # >0 blends back trajectory credit when early choices shape later success
+```
+
+Every trace in a group must report the same stage list; a group with a missing or inconsistent record, or a success whose record misses a stage, falls back to plain GRPO credit. The final stage covers only the tokens after the last intermediate boundary: if a rollout completes its last intermediate stage on its final turn, the task-reward comparison has no tokens to land on for that rollout. Credit each stage to the turn that caused it, and keep the task's last piece of real work out of the intermediate list.
 
 ### Self-Play Advantage (RAE)
 
