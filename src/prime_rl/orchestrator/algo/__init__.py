@@ -6,7 +6,8 @@ turns the signal half into runtime objects (the sampling half is the env's
 :class:`~prime_rl.orchestrator.generation_source.GenerationSource`):
 
 - one module per algorithm (``grpo``, ``echo``, ``max_rl``, ``rae``,
-  ``hierarchical_grpo``, ``opd``, ``opsd``, ``sft``, ``debug``) — each named
+  ``hierarchical_grpo``, ``temporal_grpo``, ``opd``, ``opsd``, ``sft``,
+  ``debug``) — each named
   class owns its scoring hooks
   (``score_episode`` / ``score_group``) and declares what it needs (loss
   component, a "teacher", ...). One instance per env, built by
@@ -33,6 +34,7 @@ from prime_rl.orchestrator.algo.opsd import OPSDAlgorithm
 from prime_rl.orchestrator.algo.rae import RAEAlgorithm
 from prime_rl.orchestrator.algo.routing import assign_advantages, stamp_loss_routing
 from prime_rl.orchestrator.algo.sft import SFTDistillAlgorithm
+from prime_rl.orchestrator.algo.temporal_grpo import TemporalGRPOAlgorithm
 
 if TYPE_CHECKING:
     from prime_rl.configs.algorithm import AlgoConfig
@@ -46,6 +48,7 @@ ALGORITHM_CLASSES: dict[str, type[Algorithm]] = {
     "max_rl": MaxRLAlgorithm,
     "rae": RAEAlgorithm,
     "hierarchical_grpo": HierarchicalGRPOAlgorithm,
+    "temporal_grpo": TemporalGRPOAlgorithm,
     "opd": OPDAlgorithm,
     "opsd": OPSDAlgorithm,
     "sft": SFTDistillAlgorithm,
@@ -75,6 +78,7 @@ __all__ = [
     "OPSDAlgorithm",
     "RAEAlgorithm",
     "SFTDistillAlgorithm",
+    "TemporalGRPOAlgorithm",
     "build_algorithm",
     "connect_frozen_client",
     "assign_advantages",

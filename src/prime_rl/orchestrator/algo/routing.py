@@ -8,10 +8,16 @@ from prime_rl.configs.algorithm import ActionLossType
 from prime_rl.transports.batch import TrainingSample
 
 
+def trainable_sampled_nodes(trace: vf.Trace) -> list[tuple[int, vf.MessageNode]]:
+    """(index into ``trace.nodes``, node) for each node on a trainable branch
+    with sampled tokens — the compact sampled-token order credit is assigned in."""
+    trainable_nodes = {id(node) for branch in trace.branches if branch.trainable for node in branch.nodes}
+    return [(index, node) for index, node in enumerate(trace.nodes) if id(node) in trainable_nodes and any(node.mask)]
+
+
 def assign_advantages(trace: vf.Trace, values: float | list[float]) -> None:
     """Assign credit in compact sampled-token order across trainable graph paths."""
-    trainable_nodes = {id(node) for branch in trace.branches if branch.trainable for node in branch.nodes}
-    nodes = [node for node in trace.nodes if id(node) in trainable_nodes and any(node.mask)]
+    nodes = [node for _, node in trainable_sampled_nodes(trace)]
     for node in nodes:
         if len(node.mask) != len(node.token_ids):
             raise ValueError(
