@@ -509,16 +509,12 @@ class InferenceConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_disaggregated_combined_replay(self):
-        """NIXL routed-expert capture uses the V1 runner, while sampling replay needs V2."""
-        if (
-            self.deployment.type == "disaggregated"
-            and self.enable_return_sampling_mask
-            and self.vllm.enable_return_routed_experts
-        ):
+    def validate_disaggregated_no_routed_experts(self):
+        """vLLM rejects routed-expert capture with NIXL KV transfer."""
+        if self.deployment.type == "disaggregated" and self.vllm.enable_return_routed_experts:
             raise ValueError(
-                "Combined router and sampling replay is not supported with disaggregated P/D: "
-                "NIXL routed-expert capture uses the V1 model runner, while sampling replay needs V2."
+                "Routed-expert return (enable_return_routed_experts) is not supported with disaggregated P/D: "
+                "vLLM does not capture routed experts across NIXL KV transfer."
             )
         return self
 
@@ -661,6 +657,11 @@ class InferenceConfig(BaseConfig):
 
         if self.enable_return_sampling_mask:
             namespace.return_sampling_mask = True
+
+        # The LoRA adapter is registered under the model name clients send, and vLLM rejects
+        # an adapter named like a served base model, so serve the base under another name.
+        if self.vllm.enable_lora and "served_model_name" not in extra_fields:
+            namespace.served_model_name = [f"{self.vllm.model}-base"]
 
         kv_transfer_config = self.build_kv_transfer_config()
         if kv_transfer_config is not None:
