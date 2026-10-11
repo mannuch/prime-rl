@@ -101,6 +101,9 @@ class SFTColumnsConfig(BaseConfig):
     tools: str = "tools"
     """Column with the tool schemas in OpenAI function-calling format."""
 
+    message_loss_mask: str = "message_loss_mask"
+    """Optional column of booleans or integer 0/1 flags, one per resolved message (prompt + completion for split rows). Zero excludes a message from loss; one preserves its normal supervision. Missing or null masks leave supervision unchanged."""
+
     renderer: dict[str, str] = {"reasoning_effort": "reasoning_effort"}
     """Per-sample renderer arguments as ``renderer field = dataset column``, e.g. ``reasoning_effort = "effort"``. A row's non-null value overrides the ``[renderer]`` setting; rows and datasets without the column use it unchanged."""
 
@@ -284,6 +287,13 @@ class SFTConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def resolve_freeze_moe_router_auto(self):
+        """Resolve ``model.freeze_moe_router='auto'``: SFT trains the router."""
+        if self.model.freeze_moe_router == "auto":
+            self.model.freeze_moe_router = False
+        return self
+
+    @model_validator(mode="after")
     def auto_setup_run_identity(self):
         """Auto-generate the run name (``<dataset>--<model>--<short-id>``) when unset and
         default the run directory, W&B run name and platform run name to it when not
@@ -378,13 +388,13 @@ class SFTConfig(BaseConfig):
 
     @model_validator(mode="after")
     def full_optimizer_offload_requires_supported_optimizer(self):
-        if self.model.full_offload and self.optim.type not in ("adamw", "sign_sgd"):
+        if self.model.offload == "full" and self.optim.type not in ("adamw", "sign_sgd"):
             raise ValueError("Full optimizer offload only supports AdamW and SignSGD")
         return self
 
     @model_validator(mode="after")
     def full_optimizer_offload_disables_grad_clipping(self):
-        if self.model.full_offload and self.optim.max_norm is not None:
+        if self.model.offload == "full" and self.optim.max_norm is not None:
             warnings.warn(
                 "Gradient clipping prevents optimizer-in-backward overlap with CPU optimizer offload. "
                 "Automatically setting optim.max_norm to None (disabled).",
@@ -609,12 +619,6 @@ class SFTConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_scheduler_steps(self):
         validate_scheduler(self.scheduler, self.max_steps)
-        return self
-
-    @model_validator(mode="after")
-    def validate_opt_and_fsdp_offload(self):
-        if self.optim.type == "muon" and self.model.fsdp_cpu_offload:
-            raise ValueError("Muon optimizer does not support FSDP CPU offload")
         return self
 
     ### Auto-setup and validate shared configs
