@@ -326,8 +326,8 @@ class SFTConfig(BaseConfig):
     trace_path: Path | None = None
     """Path to write the PyTorch profiler trace to."""
 
-    dist_timeout_seconds: int = 3600
-    """Timeout in seconds for torch distributed ops."""
+    dist_timeout_seconds: int = 900
+    """Timeout in seconds for torch distributed ops: a hung collective (e.g. a dead rank) fails the run after this long."""
 
     heartbeat: HeartbeatConfig | None = None
     """BetterStack heartbeat configuration for monitoring training progress."""
@@ -442,8 +442,6 @@ class SFTConfig(BaseConfig):
                     "LoRA training is not yet supported with in-memory weight broadcast. "
                     "Set weight_broadcast.type = 'filesystem'."
                 )
-            if self.eval.retrigger_on_resume:
-                raise ValueError("eval.retrigger_on_resume requires weight_broadcast.type = 'filesystem'.")
 
         if self.deployment.type == "multi_node":
             # Dedicated nodes in the SFT allocation run the inference pool, router,
@@ -645,6 +643,8 @@ class SFTConfig(BaseConfig):
 
     @model_validator(mode="after")
     def auto_setup_slurm_template(self):
+        if self.slurm is not None and self.slurm.job_name is None:
+            self.slurm.job_name = self.run.name
         if self.slurm is not None and self.slurm.template_path is None:
             templates_dir = find_package_resource("templates")
             if templates_dir is not None:

@@ -42,11 +42,10 @@ class ActivationCheckpointConfig(BaseConfig):
 
 
 class ActivationOffloadingConfig(BaseConfig):
-    pin_memory: bool = True
-    """Pin offloaded activations to CPU memory."""
+    """Offload tensors saved for backward to pinned CPU memory during the forward pass."""
 
     max_inflight_activations: int = Field(5, ge=1)
-    """Max activations kept in flight while offloading. More activations smooth overlap at the cost of GPU memory."""
+    """Max activations kept on GPU while their offload copies are in flight on the side stream. Higher values give more copy/compute overlap at the cost of GPU memory."""
 
 
 OffloadMode: TypeAlias = Literal["none", "optimizer", "full"]
@@ -314,9 +313,9 @@ class ModelConfig(BaseModelConfig):
 
     @model_validator(mode="after")
     def ac_offloading_requires_ac(self):
-        """Automatically enable activation checkpointing when activation offloading is enabled."""
-        if self.ac_offloading is not None and self.ac is None:
-            self.ac = ActivationCheckpointConfig()
+        """Activation offloading requires activation checkpointing, so ``ac = None`` disables both."""
+        if self.ac is None:
+            self.ac_offloading = None
         return self
 
     @model_validator(mode="after")
@@ -557,7 +556,7 @@ class DataLoaderConfig(BaseConfig):
     fake: FakeDataLoaderConfig | None = None
     """Use a fake data loader sampling random micro-batches (for debugging)."""
 
-    num_workers: int = Field(0, ge=0)
+    num_workers: int = Field(1, ge=0)
     """Number of background threads that prepare micro batches ahead of the training loop, analogous to torch DataLoader's ``num_workers`` but with threads instead of processes. 0 prepares them on the main thread."""
 
 
@@ -613,8 +612,8 @@ class TrainerConfig(BaseConfig):
     trace_path: Path | None = None
     """Path to write the PyTorch profiler trace to."""
 
-    dist_timeout_seconds: int = 3600
-    """Timeout in seconds for torch distributed ops."""
+    dist_timeout_seconds: int = 900
+    """Timeout in seconds for torch distributed ops: a hung collective (e.g. a dead rank) fails the run after this long."""
 
     heartbeat: HeartbeatConfig | None = None
     """BetterStack heartbeat configuration for monitoring training progress."""
