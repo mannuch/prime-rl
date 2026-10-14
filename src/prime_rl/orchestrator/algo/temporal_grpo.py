@@ -20,6 +20,8 @@ order ``assign_advantages`` walks), for stages inside one long response. Stages
 are linear prerequisites, so everything after the first uncompleted stage is
 ignored. The final stage is implicit: the task reward itself, over the tokens
 after the last intermediate stage — so the task objective is preserved exactly.
+An entry may also carry ``reward``, the scalar earned in that stage; this
+binary rule ignores it (``temporal_grpo_continuous`` is the rule that uses it).
 """
 
 from __future__ import annotations
@@ -40,11 +42,17 @@ if TYPE_CHECKING:
 
 @dataclass
 class StageRecord:
-    """One rollout reduced to what the credit rule needs."""
+    """One rollout reduced to what the credit rules need."""
 
     boundaries: list[int]  # exclusive sampled-token end offset of each completed intermediate stage
     num_tokens: int  # sampled tokens in the rollout
-    reward: float  # final-stage outcome (the task reward)
+    reward: float  # the task reward
+    stage_rewards: list[float] | None = None  # per entered intermediate stage; None = 1.0 if completed else 0.0
+
+    def stage_reward(self, k: int) -> float:
+        if self.stage_rewards is not None:
+            return self.stage_rewards[k - 1]
+        return 1.0 if k <= len(self.boundaries) else 0.0
 
 
 def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
@@ -54,26 +62,74 @@ def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
     return [(index, sum(node.mask)) for index, node in enumerate(trace.nodes) if id(node) in selected]
 
 
-def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> tuple[list[str], list[int]] | None:
-    """Stage names and completed-stage token boundaries, or None if malformed."""
+def parse_stages(
+    raw: Any, turns: list[tuple[int, int]], num_nodes: int
+) -> tuple[list[str], list[int], list[float]] | None:
+    """Stage names, completed-stage token boundaries and the reward of each
+    entered intermediate stage, or None if malformed."""
     if not isinstance(raw, list) or not all(isinstance(entry, dict) and "name" in entry for entry in raw):
         return None
     total = sum(length for _, length in turns)
     names = [str(entry["name"]) for entry in raw]
     boundaries: list[int] = []
+    rewards: list[float] = []
     for entry in raw:
-        if entry.get("node") is not None:
-            node = int(entry["node"])
+        node, token = entry.get("node"), entry.get("token")
+        completed = node is not None or token is not None
+        reward = entry.get("reward")
+        if reward is None:
+            reward = float(completed)
+        if not isinstance(reward, (int, float)):
+            return None
+        rewards.append(float(reward))
+        if not completed:
+            break  # first uncompleted stage: later stages are unreached
+        if node is not None:
+            node = int(node)
             if not 0 <= node < num_nodes:
                 return None
             end = sum(length for index, length in turns if index <= node)
-        elif entry.get("token") is not None:
-            end = min(max(int(entry["token"]), 0), total)
         else:
-            break  # first uncompleted stage: later stages are unreached
+            end = min(max(int(token), 0), total)
         # A stage is only checked after its prerequisite, so it cannot end earlier.
         boundaries.append(max(end, boundaries[-1] if boundaries else 0))
-    return names, boundaries
+    return names, boundaries, rewards
+
+
+def stage_records(
+    traces: list[vf.Trace], stage_key: str, success_threshold: float
+) -> tuple[list[StageRecord], list[str]] | None:
+    """Every trace's record plus the group's stage names, or None (reason
+    logged) when the group has no consistent stage record to credit by."""
+    records: list[StageRecord] = []
+    stage_names: list[str] | None = None
+    for trace in traces:
+        turns = sampled_turns(trace)
+        parsed = parse_stages(trace.info.get(stage_key), turns, len(trace.nodes))
+        if parsed is None:
+            return _unusable("missing or malformed stage record")
+        names, boundaries, rewards = parsed
+        if stage_names is None:
+            stage_names = names
+        elif names != stage_names:
+            return _unusable("stage lists differ within the group")
+        succeeded = trace.reward >= success_threshold
+        if succeeded and len(boundaries) < len(names):
+            return _unusable("task succeeded without completing every recorded stage")
+        records.append(StageRecord(boundaries, sum(length for _, length in turns), trace.reward, rewards))
+    assert stage_names is not None
+    return records, stage_names
+
+
+def _unusable(reason: str) -> None:
+    get_logger().debug(f"temporal_grpo: plain GRPO credit for group ({reason})")
+
+
+def grpo_credit(traces: list[vf.Trace]) -> None:
+    """Plain group-mean GRPO credit."""
+    mean = sum(trace.reward for trace in traces) / len(traces)
+    for trace in traces:
+        assign_advantages(trace, trace.reward - mean)
 
 
 def stage_advantages(
@@ -143,34 +199,14 @@ class TemporalGRPOAlgorithm(Algorithm):
         self.trajectory_weight = config.trajectory_weight
         self.success_threshold = config.success_threshold
 
-    def _fallback(self, traces: list[vf.Trace], reason: str) -> None:
-        get_logger().debug(f"temporal_grpo: plain GRPO credit for group ({reason})")
-        mean = sum(trace.reward for trace in traces) / len(traces)
-        for trace in traces:
-            assign_advantages(trace, trace.reward - mean)
-
     async def score_group(self, episodes: list[vf.Episode]) -> None:
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         if not traces:
             return
-        records: list[StageRecord] = []
-        stage_names: list[str] | None = None
-        for trace in traces:
-            turns = sampled_turns(trace)
-            parsed = parse_stages(trace.info.get(self.stage_key), turns, len(trace.nodes))
-            if parsed is None:
-                return self._fallback(traces, "missing or malformed stage record")
-            names, boundaries = parsed
-            if stage_names is None:
-                stage_names = names
-            elif names != stage_names:
-                return self._fallback(traces, "stage lists differ within the group")
-            succeeded = trace.reward >= self.success_threshold
-            if succeeded and len(boundaries) < len(names):
-                return self._fallback(traces, "task succeeded without completing every recorded stage")
-            records.append(StageRecord(boundaries, sum(length for _, length in turns), trace.reward))
-
-        assert stage_names is not None
+        group = stage_records(traces, self.stage_key, self.success_threshold)
+        if group is None:
+            return grpo_credit(traces)
+        records, stage_names = group
         per_token = stage_advantages(
             records,
             len(stage_names),

@@ -21,17 +21,19 @@ def test_parse_nodes_and_prerequisites():
     turns = [(1, 10), (3, 20), (5, 30), (7, 40)]
     raw = [{"name": "a", "node": 3}, {"name": "b", "node": 1}, {"name": "c", "node": None}, {"name": "d", "node": 7}]
     # "b" cannot end before its prerequisite; "d" is unreached because "c" never completed.
-    assert parse_stages(raw, turns, num_nodes=9) == (["a", "b", "c", "d"], [30, 30])
+    # Without a reward field, a stage pays its binary outcome.
+    assert parse_stages(raw, turns, num_nodes=9) == (["a", "b", "c", "d"], [30, 30], [1.0, 1.0, 0.0])
 
 
 def test_parse_rejects_bad_turn():
     assert parse_stages([{"name": "a", "node": 9}], [(1, 5)], num_nodes=3) is None
+    assert parse_stages([{"name": "a", "node": 1, "reward": "x"}], [(1, 5)], num_nodes=3) is None
     assert parse_stages(None, [(1, 5)], num_nodes=3) is None
 
 
 def test_parse_token_offsets():
-    raw = [{"name": "a", "token": 12}, {"name": "b", "token": 999}]
-    assert parse_stages(raw, [(1, 50)], num_nodes=2) == (["a", "b"], [12, 50])
+    raw = [{"name": "a", "token": 12, "reward": 0.4}, {"name": "b", "token": 999}]
+    assert parse_stages(raw, [(1, 50)], num_nodes=2) == (["a", "b"], [12, 50], [0.4, 1.0])
 
 
 def test_late_failure_keeps_early_credit():

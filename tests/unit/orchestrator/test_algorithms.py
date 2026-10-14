@@ -38,6 +38,7 @@ def _ref_kind(ref):
         ("grpo", {}, "policy", "rl"),
         ("max_rl", {}, "policy", "rl"),
         ("temporal_grpo", {}, "policy", "rl"),
+        ("temporal_grpo_continuous", {}, "policy", "rl"),
         ("opd", {"teacher": FROZEN}, "policy", "ref_kl"),
         ("sft", {"sampling": {"source": FROZEN}}, "frozen", "ce"),
         ("opsd", {}, "policy", "ref_kl"),

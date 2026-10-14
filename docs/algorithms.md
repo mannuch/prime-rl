@@ -149,6 +149,7 @@ At runtime, each env's `TrainEnv` (`prime_rl.orchestrator.envs`) resolves the `s
 | `rae` | `RAEAlgorithm` | `score_group`: per-agent EMA-baseline credit |
 | `hierarchical_grpo` | `HierarchicalGRPOAlgorithm` | `score_group`: GRPO baseline per episode for solvers, per group for the proposer |
 | `temporal_grpo` | `TemporalGRPOAlgorithm` | `score_group`: stage-conditioned credit on stage token intervals |
+| `temporal_grpo_continuous` | `TemporalGRPOContinuousAlgorithm` | `score_group`: stage TD credit on stage token intervals |
 | `opd` | `OPDAlgorithm` | `score_episode`: own-context prefill under the teacher |
 | `opsd` | `OPSDAlgorithm` | `score_episode`: demo-conditioned prefill under the live policy |
 | `sft` | `SFTDistillAlgorithm` | no credit assignment; CE on sampled tokens |
@@ -393,7 +394,7 @@ This algorithm is accepted only for proposer-solver envs. Use the env's `train_p
 
 GRPO broadcasts one advantage over every sampled token. A rollout that clears three stages of a task and fails the fourth is penalized for the three it cleared. `temporal_grpo` ([arXiv:2608.13026](https://arxiv.org/abs/2608.13026)) splits each rollout into ordered stage intervals and compares, for each stage, only the rollouts that *entered* it (completed its prerequisite). Stage *k*'s advantage is `completed_k - mean` over its entrants and lands only on stage *k*'s tokens. The final stage is the task reward, over the tokens after the last intermediate stage, so the task objective is unchanged. A stage whose entrants all agree contributes zero; with `constant_trainer_batch_size` (on by default), those zero-advantage tokens are also pruned from the rl denominator. A group where every rollout fails the task but they diverge at an earlier stage still carries signal.
 
-The env declares progress in `trace.info["stages"]`: the task's ordered intermediate stages, each marking the `trace.nodes` index of the assistant node whose action completed it (`None` if never completed), or a `token` offset for stages inside one long response. Where to write it depends on who can see progress:
+The env declares progress in `trace.info["stages"]`: the task's ordered intermediate stages, each marking the `trace.nodes` index of the assistant node whose action completed it (`None` if never completed), or a `token` offset for stages inside one long response. An entry may also carry a scalar `reward` for the stage; `temporal_grpo` ignores it (see [continuous stage rewards](#temporal-grpo-with-continuous-stage-rewards)). Where to write it depends on who can see progress:
 
 - **Online, in `Env.run`** — for games and simulated-user envs, where the env steps the ground truth between turns. Right after the turn that caused the change, record the latest sampled node's index. This also catches the final move, whose observation is never sent back to the model and so never becomes a node.
 - **Offline, in `Task.finalize`** — replay the transcript: the first tool result or user turn that proves a stage is credited to the assistant turn it answers (the tool call's issuer via `tool_call_id`, or a user turn's nearest sampled ancestor).
@@ -417,6 +418,21 @@ trajectory_weight = 0.0   # >0 blends back trajectory credit when early choices 
 ```
 
 Every trace in a group must report the same stage list; a group with a missing or inconsistent record, or a success whose record misses a stage, falls back to plain GRPO credit. The final stage covers only the tokens after the last intermediate boundary: if a rollout completes its last intermediate stage on its final turn, the task-reward comparison has no tokens to land on for that rollout. Credit each stage to the turn that caused it, and keep the task's last piece of real work out of the intermediate list.
+
+### Temporal GRPO with continuous stage rewards
+
+`temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward instead and credits a stage with its TD error against the group's stage values. A stage's value `V_k` is the mean reward-to-go of the rollouts that entered it; stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k*. That is the policy gradient of the rollout's return with the group as critic, applied at every stage node (plain GRPO is the one-stage case): unnormalized, a rollout's stage advantages sum to its return minus the group mean, so this redistributes GRPO's credit to the stages that earned it rather than changing the objective. By default each stage's TD errors are divided by their std over the stage's entrants (`std_normalize = true`); with binary stage rewards that makes it exactly `temporal_grpo`'s rule, in every group.
+
+The record is the same one; a stage's `reward` defaults to its binary outcome (1 if completed, 0 if not), and the env overrides it with a quality score, partial credit on a failed stage, or anything else measurable. The task reward is paid in the stage the rollout ended in: the final stage when every intermediate stage was completed, otherwise the stage it failed. So a rollout's return is its stage rewards plus the task reward, with no double counting as long as the rubric doesn't also sum the stage rewards. A completed stage with an explicit `reward` of 0 still earns the next stage's group value: completion is structural, the reward is only the scalar.
+
+`stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways "entered stage k+1" doesn't capture.
+
+```toml
+[orchestrator.train.algo]
+type = "temporal_grpo_continuous"
+std_normalize = true
+stage_lambda = 0.0   # 1 credits each stage with the rollout's remaining return
+```
 
 ### Self-Play Advantage (RAE)
 
