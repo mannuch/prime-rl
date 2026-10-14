@@ -1,31 +1,104 @@
 """Temporal GRPO with continuous stage rewards.
 
 ``temporal_grpo`` ranks the rollouts that entered a stage by a binary outcome:
-whether they completed it. Here each stage pays a scalar reward instead, and a
-stage's credit is its TD error against the group's stage values. For stage k
-of a rollout,
-
-    delta_k = q_k + completed_k * V[k + 1] - V[k]
-
-where ``q_k`` is the reward collected in stage k and ``V[k]`` is the group's
-value of entering stage k: the mean reward-to-go of the rollouts that entered
-it. Stage k's tokens get ``delta_k`` plus ``stage_lambda`` times the next
-stage's advantage.
+whether they completed it. Here each stage pays a scalar reward, and a stage's
+credit is its TD error against the group's stage values.
 
 The record is the one ``temporal_grpo`` reads. An entry may carry ``reward``,
 the scalar earned in that stage; absent, a stage pays 1 when completed and 0
 when not — the paper's binary outcome. The task reward is paid in the stage the
 rollout ended in: the final stage when every intermediate stage was completed,
-otherwise the stage it failed. A rollout's return is therefore the sum of its
-stage rewards plus the task reward.
+otherwise the stage it failed.
 
-With binary stage rewards and ``std_normalize`` this equals ``temporal_grpo``
-with ``std_normalize`` (the paper's rule) in every group: the TD error is then
-``(1 + V[k + 1]) * (completed_k - mean)`` and normalization cancels the factor.
-Unnormalized, a rollout's stage advantages sum to its return minus the group
-mean — GRPO's credit, redistributed to the stages that earned it — and
-``stage_lambda = 1`` credits each stage with the rollout's remaining return
-minus ``V[k]``.
+Derivation
+----------
+For rollout i of a group and stages k = 1..K (K is the task stage):
+
+    n_i       stages entered: completed 1..n_i - 1, ended in n_i
+    c[i,k]    1 if k < n_i else 0 (completed stage k)
+    E_k       entrants {i : n_i >= k}; E_{k+1} is exactly the completers of k
+    q[i,k]    reward collected in stage k (the task reward lands at k = n_i)
+    G[i,k]    reward-to-go: sum_{j=k..n_i} q[i,j] = q[i,k] + c[i,k] * G[i,k+1]
+
+Over E_k: V_k = mean G[., k] (the group's value of entering stage k),
+mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
+
+1. Recursion. Expand G in V_k; c[i,k] = 1 exactly on E_{k+1}, so
+
+       V_k = mu_k + p_k * V_{k+1}
+
+2. TD error. Stage k earns its reward plus the value of the state it hands
+   off, minus the value of the state it started from. By 1,
+
+       delta[i,k] = q[i,k] + c[i,k] * V_{k+1} - V_k
+                  = (q[i,k] - mu_k) + V_{k+1} * (c[i,k] - p_k)
+
+   a quality term and a progression term, both in reward units.
+
+3. Centered. Both terms average to zero over E_k. A stage with one entrant,
+   or whose entrants all agree, contributes zero.
+
+4. Conservation. A rollout's deltas telescope:
+
+       sum_{k=1..n_i} delta[i,k] = G[i,1] - V_1
+
+   which is GRPO's advantage on the total return, redistributed to the stages
+   that earned it. The paper's Stage-Reward GRPO baseline instead broadcasts
+   this one value over every token.
+
+5. Paper reduction. With default stage rewards and a binary task reward,
+   q[i,k] is the paper's outcome R[i,k], and mu_k = p_k for k < K, so
+
+       delta[i,k] = (1 + V_{k+1}) * (R[i,k] - mu_k)
+
+   The factor is shared by stage k's entrants, so dividing by their std
+   (``std_normalize``) gives the paper's (R[i,k] - mu_k) / sigma_k (Eq. 23).
+   The factor is at least 1. A default stage reward of 0 would leave only
+   V_{k+1}, which is 0 in a group where every rollout fails the task, and
+   would erase the signal in the groups the method exists for.
+
+6. Lambda. A[i,n_i] = delta[i,n_i] and A[i,k] = delta[i,k] + stage_lambda *
+   A[i,k+1]. At 0 a stage answers only for its reward and the state it hands
+   off; at 1 it telescopes as in 4 to G[i,k] - V_k, the remaining return.
+
+Why the TD error: with "entered stage k" as the state and the stage's tokens
+as the action, delta is the actor-critic advantage with the group mean as the
+critic; GRPO is the one-stage case. It charges a stage only for what it
+controlled, which is the paper's rule against credit aliasing, in units where
+stage quality and progression add. It assumes a stage's entrants are
+interchangeable; ``stage_lambda`` > 0 lets later outcomes flow back when the
+quality of a stage's work carries into the next.
+
+Knobs
+-----
+``stage_lambda`` (default 0) sets how much of a rollout's later outcome its
+earlier stages answer for. At 0, every rollout that enters stage k+1 hands
+off the same value V_{k+1}, so a stage is not blamed for what happens after
+it: the lowest-variance setting, and the one that keeps credit aliasing out.
+That is right when completing a stage captures everything later stages need.
+It is wrong when stages complete well or badly in ways the next stage feels:
+a grasp that holds but slips in transport, a patch that passes ``reproduce``
+but makes ``verify`` harder. At 0 those handoffs earn the same credit. The
+symptom is a stage's completion rate rising while the next stage's completion
+rate among its entrants falls. Two fixes, best first: make the stage's
+``reward`` measure the quality of the handoff (or split the stage), so the
+TD error sees it directly; or raise ``stage_lambda`` so later outcomes flow
+back, at the cost of variance and some of the aliasing the method removes.
+1 gives each stage its full remaining return, G[i,k] - V_k.
+
+``std_normalize`` (default on) divides each stage's credits by their std over
+the stage's entrants. On, every stage that separates its entrants contributes
+unit-scale signal, whatever its reward scale or entrant count; stage rewards
+on unrelated scales then need no calibration, and with binary rewards this is
+the paper's rule. The cost: a late stage with few entrants, or continuous
+rewards that differ only by noise, get that noise blown up to full size, and
+4 no longer holds, so a stage's weight in the update stops reflecting how much
+it moves the return. Off, credit stays in reward units: conservation holds, a
+stage that decides more of the return gets more weight, and this matches
+prime-rl's GRPO, which does not normalize. Turn it off when stage rewards are
+on one meaningful scale and you want each stage weighted by how much it
+matters; keep it on for binary or mixed-scale rewards. With it on, the lambda
+sum mixes per-stage-normalized deltas, so 1 is exactly G[i,k] - V_k only off.
 """
 
 from __future__ import annotations
