@@ -484,6 +484,12 @@ Otherwise, add handoff signals in this order, stopping when the diagnostics belo
 3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
 4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
 
+**When every stage always completes**, the default is still a `score`, but checked sooner. A `score` is easiest to fit here: every rollout completes every stage, so each stage's fit uses the whole group and the few-completers reason to start with a `value` never applies. It also matters more. With no failures there is no progression signal to fall back on, so a `score` that shrinks to zero leaves per-stage GRPO, and with default stage rewards only the final segment trains. Three adjustments:
+
+1. **Check whether a stricter completion check would split the rollouts.** A stage that always completes may have too loose a predicate. Tightening it ("holds through a shake", not "gripper closed") turns quality into the gate and restores discrete conditioning with no calibration at all; a `score` can still sit on top.
+2. **Score the handoff state, not the stage's work.** With every rollout a completer, a `score` that is a linear function of the stage's `reward` merges into the quality term, and `std_normalize` cancels it; the same holds for a `value`. Measure where things ended up, not how well the stage scored.
+3. **Look at the logged slope early**, and move to a `pool` key, larger groups or an offline-calibrated `value` sooner than you would when stages can fail.
+
 Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and a `score` or `value` is the place to express it.
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
