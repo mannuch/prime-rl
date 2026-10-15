@@ -57,7 +57,7 @@ def test_binary_stages_reproduce_temporal_grpo(failure_reward):
 
 
 def test_derivation_identities_on_random_groups():
-    # The docstring's steps 1, 3, 4, 6 and 7, checked against the code on random groups with
+    # The docstring's steps 1, 3, 4, 6, 7 and 9, checked against the code on random groups with
     # failures, continuous stage and task rewards, and handoff values.
     rng = random.Random(0)
     for _ in range(60):
@@ -116,6 +116,27 @@ def test_derivation_identities_on_random_groups():
             assert stage_values(r, adv_one[i]) == pytest.approx(
                 [G[i][k - 1] - V[k] for k in range(1, n[i] + 1)][: len(stage_values(r, adv_one[i]))]
             )  # step 6
+        # step 9: under lambda, handoff-out is scaled by (1 - lambda) and handoff-in keeps full weight
+        lam = rng.choice([0.3, 0.7, 1.0])
+        unshaped = [StageRecord(r.boundaries, r.num_tokens, r.reward, r.stage_rewards) for r in records]
+        shaped_lam = stage_advantages(records, num_intermediate, std_normalize=False, stage_lambda=lam)
+        plain_lam = stage_advantages(unshaped, num_intermediate, std_normalize=False, stage_lambda=lam)
+        phi_mean = [0.0] * (num_stages + 1)
+        for j in range(1, num_intermediate + 1):
+            completers = [r for r in records if len(r.boundaries) >= j]
+            if completers:
+                phi_mean[j] = sum(r.stage_value(j) for r in completers) / len(completers)
+
+        def psi(r, j):
+            return r.stage_value(j) - phi_mean[j] if 1 <= j <= len(r.boundaries) else 0.0
+
+        for i, r in enumerate(records):
+            got, plain = stage_values(r, shaped_lam[i]), stage_values(r, plain_lam[i])
+            want = [
+                plain[k - 1] - psi(r, k - 1) + (1 - lam) * sum(lam ** (j - k) * psi(r, j) for j in range(k, n[i]))
+                for k in range(1, len(got) + 1)
+            ]
+            assert got == pytest.approx(want)
 
 
 def test_late_failure_keeps_early_credit():

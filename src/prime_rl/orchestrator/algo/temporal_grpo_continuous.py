@@ -122,6 +122,33 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
        differences in level cannot confound. A key's moments come only from
        earlier groups, decayed by score_decay per group.
 
+9. Lambda with handoff values. For a completed stage j, write
+   psi[i,j] = phi[i,j] - (mean phi_j over E_{j+1}). In the lambda-sum of
+   shaped credits, psi[i,j] enters delta'_j as handoff-out with weight
+   lambda^(j-k) and delta'_{j+1} as handoff-in with weight -lambda^(j-k+1).
+   Collecting terms, with A the unshaped lambda-credit and no normalization:
+
+       A'[i,k] = A[i,k] - psi[i,k-1]
+                 + (1 - lambda) * sum_{j=k..n_i-1} lambda^(j-k) * psi[i,j]
+
+   Handoff-in keeps full weight at every lambda; handoff-out is scaled by
+   (1 - lambda). At 0 this is 7. At 1, A' = G[i,k] - V_k - psi[i,k-1]: the
+   carry-forward comes from the realised return, and phi survives only
+   through psi[i,k-1], a function of the state stage k started from. Since
+   E[grad log pi(a_k | s_k) f(s_k)] = 0 for any such f, it is a baseline:
+   whatever its calibration it cannot bias stage k, only change its
+   variance (a good phi lowers it; a badly over-scaled one can raise it).
+   In between, the carry-forward is (1 - lambda) parts phi's prediction and
+   lambda parts sampled return; for a fitted score (8), lambda adds back
+   that fraction of the residual the projection drops. With phi = V
+   exactly, every delta'_j has zero mean given s_j, so A' is unbiased at
+   every lambda and raising lambda only adds variance. The baseline
+   argument needs phi[i,k-1] to depend on nothing rollout i did after stage
+   k - 1: for a value, that it is computed from the handoff state alone; for
+   a fitted score, the leave-one-out of 8. With ``std_normalize`` each stage
+   is rescaled before the sum, so the (1 - lambda) cancellation is exact
+   only unnormalized.
+
 Why the TD error: with "entered stage k" as the state and the stage's tokens
 as the action, delta is the actor-critic advantage with the group mean as the
 critic; GRPO is the one-stage case. It charges a stage only for what it
@@ -145,7 +172,12 @@ rate among its entrants falls. Two fixes, best first: give the stage a
 ``value`` (7), or split the stage, so the TD error sees the handoff directly;
 or raise ``stage_lambda`` so later outcomes flow back, at the cost of
 variance and some of the aliasing the method removes.
-1 gives each stage its full remaining return, G[i,k] - V_k.
+1 gives each stage its full remaining return, G[i,k] - V_k. With a value or
+score in place, 9 says what ``stage_lambda`` does to it: at 0 the signal
+carries the carry-forward and its calibration matters; near 1 it is only a
+baseline for the next stage, so a miscalibrated one costs variance, never
+bias. Start at 0 with a signal in place, and raise it only if the symptom
+persists.
 
 ``std_normalize`` (default off) divides each stage's credits by their std over
 the stage's entrants. Off, credit stays in reward units: conservation (4)
