@@ -50,14 +50,16 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
 
 5. Paper reduction. With default stage rewards, a completer of stage k < K
    collects 1 and a rollout failing it collects its task reward r_f, so
-   with the paper's outcome R[i,k] = c[i,k] and mu_k = p_k + (1 - p_k) r_f,
+   mu_k = p_k + (1 - p_k) r_f, and both terms of 2 are multiples of
+   c[i,k] - p_k. With the paper's outcome R[i,k] = c[i,k], whose mean over
+   the entrants is p_k,
 
-       delta[i,k] = (1 - r_f + V_{k+1}) * (R[i,k] - mu_k)
+       delta[i,k] = (1 - r_f + V_{k+1}) * (R[i,k] - p_k)
 
    whenever every rollout failing stage k has the same r_f (a binary task
    reward gives r_f = 0). The factor is shared by stage k's entrants, so
    dividing by their std (``std_normalize``) gives the paper's
-   (R[i,k] - mu_k) / sigma_k (Eq. 23) as long as it is positive, i.e. as
+   (R[i,k] - p_k) / sigma_k (Eq. 23) as long as it is positive, i.e. as
    long as completing the stage is worth more than failing it; where it is
    not, this rule reverses the paper's sign and is right to. The factor is
    at least 1 for a binary task reward. A default stage reward of 0 would
