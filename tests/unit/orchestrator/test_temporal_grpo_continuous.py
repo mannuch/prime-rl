@@ -1,6 +1,7 @@
 """Temporal GRPO with continuous stage rewards: TD credit over stages."""
 
 import itertools
+import math
 
 import pytest
 
@@ -147,11 +148,28 @@ def test_uninformative_score_is_unshaped():
     assert stage_advantages(constant, 1) == stage_advantages(unscored, 1)
 
 
+def test_slope_and_standard_error_match_the_textbook():
+    # b = Sxy / Sxx = 9.5 / 5, RSS = Syy - b * Sxy = 0.7, SE = sqrt(RSS / (n - 2) / Sxx).
+    slope, se = Moments.of([(0.0, 1.0), (1.0, 3.0), (2.0, 4.0), (3.0, 7.0)]).slope()
+    assert (slope, se) == (pytest.approx(1.9), pytest.approx(math.sqrt(0.7 / 2 / 5)))
+
+
 def test_shrinkage_pulls_noisy_slopes_to_zero():
     assert shrunk(2.0, 0.0, 1.0) == 2.0  # an exact fit is kept whole
     assert shrunk(1.0, 1.0, 1.0) == pytest.approx(0.5)  # one standard error from zero keeps half
     assert shrunk(1.0, 1.0, 0.0) == 1.0  # no shrinkage trusts the fit
     assert shrunk(*Moments().slope(), 1.0) == 0.0  # an undetermined fit is no shaping
+    assert shrunk(1.5, math.inf, 0.0) == 0.0  # and stays so without shrinkage (no 0 * inf)
+
+
+def test_prior_moments_fit_a_group_too_small_to_fit_alone():
+    # Three completers leave two points for each leave-one-out fit, which is no slope.
+    records = scored([0.0, 1.0, 2.0], [0.0, 2.0, 4.0])
+    alone, _ = fit_handoff_values(records, 1, {})
+    assert [v for r in alone for v in r.stage_values] == pytest.approx([0.0, 0.0, 0.0])
+    prior = Moments.of([(0.0, 0.0), (1.0, 2.0), (2.0, 4.0), (3.0, 6.0)])
+    pooled, _ = fit_handoff_values(records, 1, {1: prior})
+    assert [v for r in pooled for v in r.stage_values] == pytest.approx([-2.0, 0.0, 2.0])
 
 
 def test_pooled_slope_ignores_group_levels():

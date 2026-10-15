@@ -31,6 +31,10 @@ def test_parse_rejects_bad_turn():
     assert parse_stages([{"name": "a", "node": 1, "reward": "x"}], [(1, 5)], num_nodes=3) is None
     assert parse_stages([{"name": "a", "node": 1, "value": "x"}], [(1, 5)], num_nodes=3) is None
     assert parse_stages([{"name": "a", "node": 1, "score": "x"}], [(1, 5)], num_nodes=3) is None
+    # A non-finite number would poison every advantage in the group.
+    for field in ("reward", "value", "score"):
+        assert parse_stages([{"name": "a", "node": 1, field: float("nan")}], [(1, 5)], num_nodes=3) is None
+        assert parse_stages([{"name": "a", "node": 1, field: float("inf")}], [(1, 5)], num_nodes=3) is None
     assert parse_stages(None, [(1, 5)], num_nodes=3) is None
 
 

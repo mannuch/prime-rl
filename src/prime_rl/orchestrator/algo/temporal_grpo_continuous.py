@@ -88,12 +88,13 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
        phi[i,k] = b_k * (x[i,k] - mean x[.,k]),
        b_k      = Cov(G[.,k+1], x[.,k]) / Var(x[.,k])
 
-   Only the slope matters: a constant added to phi cancels in the centering
-   of 3, and the fitted values average V_{k+1} over the completers, so each
-   completion is priced at its own predicted handoff. The handoff-out term
-   becomes stage_lambda = 1 projected onto the score: it keeps the part of
-   stage k's realised downstream deviation that x predicts and drops the
-   residual, which is later stages' own actions and luck. As in 7, totals
+   Only the slope matters: a constant added to phi cancels in 3, so the fit
+   is centered and carries no intercept, and a completion is priced at
+   V_{k+1} + phi, its own predicted handoff. The handoff-out term becomes
+   stage_lambda = 1 projected onto the score: it keeps the part of stage k's
+   realised downstream deviation that x predicts and drops the residual,
+   which is later stages' own actions and luck. A score that measures the
+   state with noise attenuates the slope, toward no shaping. As in 7, totals
    are unchanged whatever the fit; a bad slope can only move credit between
    a rollout's own stages. Three guards:
      - each rollout's slope is fit without its own return (leave-one-out),
@@ -218,7 +219,7 @@ class Moments:
 
 def shrunk(slope: float, se: float, shrinkage: float) -> float:
     """A slope t = slope / se standard errors from zero keeps t^2 / (t^2 + shrinkage) of itself."""
-    if slope == 0.0:
+    if slope == 0.0 or not math.isfinite(se):
         return 0.0
     return slope * slope**2 / (slope**2 + shrinkage * se**2)
 

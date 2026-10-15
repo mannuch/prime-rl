@@ -29,6 +29,7 @@ them all (``temporal_grpo_continuous`` is the rule that uses them).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -93,6 +94,10 @@ def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
     return [(index, sum(node.mask)) for index, node in enumerate(trace.nodes) if id(node) in selected]
 
 
+def _finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
 def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> ParsedStages | None:
     """The record's stages, with the reward of each entered intermediate stage
     and the handoff fields of each completed one, or None if malformed."""
@@ -111,7 +116,7 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
         reward = entry.get("reward")
         if reward is None:
             reward = float(completed)
-        if not isinstance(reward, (int, float)):
+        if not _finite(reward):
             return None
         rewards.append(float(reward))
         value, score, pool = entry.get("value"), entry.get("score"), entry.get("pool")
@@ -125,7 +130,7 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
             return None
         if value is None:
             value = 0.0
-        if not isinstance(value, (int, float)) or (score is not None and not isinstance(score, (int, float))):
+        if not _finite(value) or (score is not None and not _finite(score)):
             return None
         values.append(float(value))
         scores.append(None if score is None else float(score))
