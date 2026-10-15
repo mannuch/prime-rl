@@ -141,8 +141,9 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
    In between, the carry-forward is (1 - lambda) parts phi's prediction and
    lambda parts sampled return; for a fitted score (8), lambda adds back
    that fraction of the residual the projection drops. With phi = V
-   exactly, every delta'_j has zero mean given s_j, so A' is unbiased at
-   every lambda and raising lambda only adds variance. The baseline
+   exactly, every delta'_j has zero mean given s_j up to the sampling error
+   of the group means (as in 7), so A' is unbiased at every lambda in that
+   sense and raising lambda only adds variance. The baseline
    argument needs phi[i,k-1] to depend on nothing rollout i did after stage
    k - 1: for a value, that it is computed from the handoff state alone; for
    a fitted score, the leave-one-out of 8. With ``std_normalize`` each stage
