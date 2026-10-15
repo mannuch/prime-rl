@@ -468,16 +468,23 @@ A group has 8–16 rollouts, so the fit is noisy. To pool it across groups, give
 
 Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled` when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
 
-**Which to use.** Add handoff signals in this order, stopping when the diagnostics below stop pointing at a handoff effect:
+**Which to use.** `value` costs no estimation noise and works from a single completer, so when you can write one, it's the better signal. **Start with `value`** when any of these holds:
+
+- **You can compute the forecast.** The env sees the state well enough to know what's left: a simulator with privileged state and a known success model, or remaining work that's fixed arithmetic (say, the stage rewards still ahead, each with a known pass rate from this state).
+- **You can calibrate offline.** You have logged rollouts from an earlier run, or the logged `score_slope`s from a `score`-based one, and can fit the mapping from your measurement to downstream return once, outside training.
+- **The stage is rarely completed by many rollouts in a group.** A per-group fit needs at least 4 completers of the stage before it produces a slope at all (each rollout's fit leaves itself out and needs 3 points), so a late stage that 2 or 3 rollouts in a group reach gets no shaping from a `score` unless it has a `pool` key with history.
+- **Several measurements matter and you know how they combine.** A fit uses one score. If the handoff depends on, say, both test count and diff size in a known way, combine them into a value yourself rather than collapsing them into one uncalibrated number.
+
+Don't start with `value` if all you have is a ranking or a measurement with no known scale: a miscalibrated value distorts credit, and `std_normalize` won't correct it. Use `score` and let the group calibrate it.
+
+Otherwise, add handoff signals in this order, stopping when the diagnostics below stop pointing at a handoff effect:
 
 1. Nothing: completion marks and, where useful, stage rewards.
 2. `score`, fit per group.
 3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
 4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
 
-If you already have a calibrated forecast (a simulator with privileged state and a known success model, say), skip to `value`: it costs no estimation noise at all.
-
-Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and `value` is the place to express it.
+Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and a `score` or `value` is the place to express it.
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
 
