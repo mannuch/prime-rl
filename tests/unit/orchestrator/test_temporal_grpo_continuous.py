@@ -6,7 +6,13 @@ import pytest
 
 from prime_rl.orchestrator.algo import temporal_grpo as binary
 from prime_rl.orchestrator.algo.temporal_grpo import StageRecord
-from prime_rl.orchestrator.algo.temporal_grpo_continuous import stage_advantages
+from prime_rl.orchestrator.algo.temporal_grpo_continuous import (
+    Moments,
+    fit_handoff_values,
+    score_pools,
+    shrunk,
+    stage_advantages,
+)
 
 
 def spans(values):
@@ -103,6 +109,64 @@ def test_handoff_values_shape_credit():
     unshaped = [StageRecord(r.boundaries, r.num_tokens, r.reward) for r in records]
     zeroed = [StageRecord(r.boundaries, r.num_tokens, r.reward, stage_values=[0.0]) for r in records]
     assert stage_advantages(zeroed, 1) == stage_advantages(unshaped, 1)
+
+
+def scored(scores, rewards, pool=None):
+    """One intermediate stage every rollout completes, scored; the task reward is all that follows it."""
+    return [
+        StageRecord([5], 10, reward, stage_scores=[score], stage_pools=[pool])
+        for score, reward in zip(scores, rewards, strict=True)
+    ]
+
+
+def test_linear_score_recovers_slope_and_conserves_credit():
+    # Downstream return is exactly 2 * score + 1, so every leave-one-out slope is 2 with no error.
+    records = scored([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
+    filled, moments = fit_handoff_values(records, 1, {})
+    assert [v for r in filled for v in r.stage_values] == pytest.approx([-3.0, -1.0, 1.0, 3.0])
+    assert moments[1].slope() == (pytest.approx(2.0), pytest.approx(0.0, abs=1e-6))
+    # The potentials telescope: totals are still the raw return minus the group mean (5).
+    adv = stage_advantages(filled, 1, std_normalize=False)
+    for record, tokens in zip(filled, adv, strict=True):
+        assert sum(stage_values(record, tokens)) == pytest.approx(1.0 + record.reward - 5.0)
+
+
+def test_fit_leaves_own_return_out():
+    records = scored([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
+    changed = scored([0.0, 1.0, 2.0, 3.0], [9.0, 3.0, 5.0, 7.0])
+    before, _ = fit_handoff_values(records, 1, {})
+    after, _ = fit_handoff_values(changed, 1, {})
+    # Rollout 0's outcome moves the slope that credits the others, never its own.
+    assert after[0].stage_values == before[0].stage_values
+    assert after[1].stage_values != before[1].stage_values
+
+
+def test_uninformative_score_is_unshaped():
+    unscored = [StageRecord([5], 10, reward) for reward in (1.0, 0.0, 1.0, 0.0)]
+    constant, _ = fit_handoff_values(scored([2.0] * 4, [1.0, 0.0, 1.0, 0.0]), 1, {})
+    assert stage_advantages(constant, 1) == stage_advantages(unscored, 1)
+
+
+def test_shrinkage_pulls_noisy_slopes_to_zero():
+    assert shrunk(2.0, 0.0, 1.0) == 2.0  # an exact fit is kept whole
+    assert shrunk(1.0, 1.0, 1.0) == pytest.approx(0.5)  # one standard error from zero keeps half
+    assert shrunk(1.0, 1.0, 0.0) == 1.0  # no shrinkage trusts the fit
+    assert shrunk(*Moments().slope(), 1.0) == 0.0  # an undetermined fit is no shaping
+
+
+def test_pooled_slope_ignores_group_levels():
+    # Two groups with the same within-group slope at different score levels.
+    low = [(0.0, 0.0), (1.0, 2.0), (2.0, 4.0)]
+    high = [(10.0, 0.0), (11.0, 2.0), (12.0, 4.0)]
+    assert (Moments.of(low) + Moments.of(high)).slope()[0] == pytest.approx(2.0)
+    # Pooling the raw points would mistake the level difference for a slope.
+    assert Moments.of(low + high).slope()[0] < 0.5
+
+
+def test_score_pools_require_agreement_within_a_stage():
+    assert score_pools(scored([0.0, 1.0], [1.0, 0.0], pool="p"), 1) == {1: "p"}
+    assert score_pools(scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1) is None
+    assert score_pools(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1) is None
 
 
 def test_stage_lambda_one_is_return_to_go():

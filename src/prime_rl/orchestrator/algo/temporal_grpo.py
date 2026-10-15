@@ -21,15 +21,16 @@ are linear prerequisites, so everything after the first uncompleted stage is
 ignored. The final stage is implicit: the task reward itself, over the tokens
 after the last intermediate stage — so the task objective is preserved exactly.
 An entry may also carry ``reward``, the scalar earned in that stage, and a
-completed entry a ``value``, the env's estimate of the return still expected
-from the state it handed off; this binary rule ignores both
-(``temporal_grpo_continuous`` is the rule that uses them).
+completed entry either a ``value``, the env's estimate of the return still
+expected from the state it handed off, or a ``score`` of that state (with an
+optional ``pool`` key) for the algorithm to calibrate; this binary rule ignores
+them all (``temporal_grpo_continuous`` is the rule that uses them).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import verifiers.v1 as vf
 
@@ -51,6 +52,8 @@ class StageRecord:
     reward: float  # the task reward
     stage_rewards: list[float] | None = None  # per entered intermediate stage; None = 1.0 if completed else 0.0
     stage_values: list[float] | None = None  # per completed intermediate stage: value of the state it handed off
+    stage_scores: list[float | None] | None = None  # per completed intermediate stage: uncalibrated handoff score
+    stage_pools: list[str | None] | None = None  # per completed intermediate stage: key sharing the score's fit
 
     def stage_reward(self, k: int) -> float:
         if self.stage_rewards is not None:
@@ -63,6 +66,25 @@ class StageRecord:
             return 0.0
         return self.stage_values[k - 1]
 
+    def stage_score(self, k: int) -> float | None:
+        if self.stage_scores is None or not 1 <= k <= len(self.boundaries):
+            return None
+        return self.stage_scores[k - 1]
+
+    def stage_pool(self, k: int) -> str | None:
+        if self.stage_pools is None or not 1 <= k <= len(self.boundaries):
+            return None
+        return self.stage_pools[k - 1]
+
+
+class ParsedStages(NamedTuple):
+    names: list[str]
+    boundaries: list[int]  # per completed intermediate stage
+    rewards: list[float]  # per entered intermediate stage
+    values: list[float]  # per completed intermediate stage
+    scores: list[float | None]  # per completed intermediate stage
+    pools: list[str | None]  # per completed intermediate stage
+
 
 def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
     """(index into ``trace.nodes``, sampled-token count) per trainable sampled
@@ -71,12 +93,9 @@ def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
     return [(index, sum(node.mask)) for index, node in enumerate(trace.nodes) if id(node) in selected]
 
 
-def parse_stages(
-    raw: Any, turns: list[tuple[int, int]], num_nodes: int
-) -> tuple[list[str], list[int], list[float], list[float]] | None:
-    """Stage names, completed-stage token boundaries, the reward of each
-    entered intermediate stage and the handoff value of each completed one,
-    or None if malformed."""
+def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> ParsedStages | None:
+    """The record's stages, with the reward of each entered intermediate stage
+    and the handoff fields of each completed one, or None if malformed."""
     if not isinstance(raw, list) or not all(isinstance(entry, dict) and "name" in entry for entry in raw):
         return None
     total = sum(length for _, length in turns)
@@ -84,6 +103,8 @@ def parse_stages(
     boundaries: list[int] = []
     rewards: list[float] = []
     values: list[float] = []
+    scores: list[float | None] = []
+    pools: list[str | None] = []
     for entry in raw:
         node, token = entry.get("node"), entry.get("token")
         completed = node is not None or token is not None
@@ -93,16 +114,22 @@ def parse_stages(
         if not isinstance(reward, (int, float)):
             return None
         rewards.append(float(reward))
-        value = entry.get("value")
+        value, score, pool = entry.get("value"), entry.get("score"), entry.get("pool")
         if not completed:
-            if value is not None:
+            if value is not None or score is not None or pool is not None:
                 return None  # a failed stage hands nothing off
             break  # first uncompleted stage: later stages are unreached
+        if value is not None and score is not None:
+            return None  # a handoff is either forecast by the env or fitted from its score, not both
+        if pool is not None and (score is None or not isinstance(pool, str)):
+            return None
         if value is None:
             value = 0.0
-        if not isinstance(value, (int, float)):
+        if not isinstance(value, (int, float)) or (score is not None and not isinstance(score, (int, float))):
             return None
         values.append(float(value))
+        scores.append(None if score is None else float(score))
+        pools.append(pool)
         if node is not None:
             node = int(node)
             if not 0 <= node < num_nodes:
@@ -112,7 +139,7 @@ def parse_stages(
             end = min(max(int(token), 0), total)
         # A stage is only checked after its prerequisite, so it cannot end earlier.
         boundaries.append(max(end, boundaries[-1] if boundaries else 0))
-    return names, boundaries, rewards, values
+    return ParsedStages(names, boundaries, rewards, values, scores, pools)
 
 
 def stage_records(
@@ -127,15 +154,25 @@ def stage_records(
         parsed = parse_stages(trace.info.get(stage_key), turns, len(trace.nodes))
         if parsed is None:
             return _unusable("missing or malformed stage record")
-        names, boundaries, rewards, values = parsed
         if stage_names is None:
-            stage_names = names
-        elif names != stage_names:
+            stage_names = parsed.names
+        elif parsed.names != stage_names:
             return _unusable("stage lists differ within the group")
         succeeded = trace.reward >= success_threshold
-        if succeeded and len(boundaries) < len(names):
+        if succeeded and len(parsed.boundaries) < len(parsed.names):
             return _unusable("task succeeded without completing every recorded stage")
-        records.append(StageRecord(boundaries, sum(length for _, length in turns), trace.reward, rewards, values))
+        num_tokens = sum(length for _, length in turns)
+        records.append(
+            StageRecord(
+                parsed.boundaries,
+                num_tokens,
+                trace.reward,
+                parsed.rewards,
+                parsed.values,
+                parsed.scores,
+                parsed.pools,
+            )
+        )
     assert stage_names is not None
     return records, stage_names
 

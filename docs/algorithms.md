@@ -458,6 +458,25 @@ interaction.trace.info["stages"] = [
 
 reproduce completed (reward 1 by default) and left a state worth 0.6; patch completed with quality 0.8 and raised the outlook to 0.9; verify failed, earning 0.2, and the task reward 0 lands there. After shaping the stages pay 1.6, 1.1 and −0.7: verify is charged for the 0.9 outlook it squandered. The total, 2.0, is the raw sum, as it always is.
 
+**`score` is a `value` the algorithm calibrates for you.** Most env authors have *measurements* of a handoff (the diff size, how many visible tests pass, the grasp's offset from centre) but not *forecasts* in reward units. Put the measurement in `score`, on any scale and in either direction. Within each group, the algorithm regresses what actually happened after the stage on it, and uses the slope to turn the score into a value. A completed entry carries `value` or `score`, never both, and within a group a stage's completers must all carry a `score` or none of them. Three things keep a bad score from doing harm:
+
+- a slope that's within about a standard error of zero is shrunk toward zero (`score_shrinkage`), which means no shaping, i.e. the rule without a handoff signal;
+- each rollout's slope is fit without its own outcome;
+- whatever the slope, shaping only moves credit between a rollout's own stages; it never changes the rollout's total.
+
+A group has 8–16 rollouts, so the fit is noisy. To pool it across groups, give the entry a `pool` key: groups whose entries share a key share one fit, remembered over about `1 / (1 − score_decay)` groups. What a key means is your call, and nothing else is pooled. Use the task's identity in the key (`f"{task_id}/grasp"`) to pool one task with itself across epochs; use one key for a family of tasks only when you're confident the same score predicts the same thing across them. Pooling trades noise for staleness: a pooled fit remembers how an older policy turned handoffs into return.
+
+Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled` when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
+
+**Which to use.** Add handoff signals in this order, stopping when the diagnostics below stop pointing at a handoff effect:
+
+1. Nothing: completion marks and, where useful, stage rewards.
+2. `score`, fit per group.
+3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
+4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
+
+If you already have a calibrated forecast (a simulator with privileged state and a known success model, say), skip to `value`: it costs no estimation noise at all.
+
 Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and `value` is the place to express it.
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
@@ -466,7 +485,9 @@ Write the record where you write the completion marks (`Env.run` online or `Task
 [orchestrator.train.algo]
 type = "temporal_grpo_continuous"
 std_normalize = false   # true reproduces the paper's rule for binary stages
-stage_lambda = 0.0   # 1 credits each stage with the rollout's remaining return
+stage_lambda = 0.0      # 1 credits each stage with the rollout's remaining return
+score_shrinkage = 1.0   # only for stages whose entries carry a score
+score_decay = 0.9       # only for entries that carry a pool key
 ```
 
 ### Self-Play Advantage (RAE)

@@ -9,7 +9,8 @@ the scalar earned in that stage; absent, a stage pays 1 when completed and 0
 when not — the paper's binary outcome. The task reward is paid in the stage the
 rollout ended in: the final stage when every intermediate stage was completed,
 otherwise the stage it failed. A completed entry may also carry ``value``, the
-env's estimate of the return still expected from the state it handed off (7).
+env's estimate of the return still expected from the state it handed off (7),
+or instead a ``score`` of that state for the rule to calibrate (8).
 
 Derivation
 ----------
@@ -80,6 +81,31 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
    beta * V leaves (1 - beta) of the bias, and ``std_normalize`` rescales
    delta, not phi against q.
 
+8. Fitted handoff values. A completed entry may carry a ``score`` x instead,
+   any measurement of the handoff state, on any scale. Over stage k's
+   completers, regress the raw downstream return on it:
+
+       phi[i,k] = b_k * (x[i,k] - mean x[.,k]),
+       b_k      = Cov(G[.,k+1], x[.,k]) / Var(x[.,k])
+
+   Only the slope matters: a constant added to phi cancels in the centering
+   of 3, and the fitted values average V_{k+1} over the completers, so each
+   completion is priced at its own predicted handoff. The handoff-out term
+   becomes stage_lambda = 1 projected onto the score: it keeps the part of
+   stage k's realised downstream deviation that x predicts and drops the
+   residual, which is later stages' own actions and luck. As in 7, totals
+   are unchanged whatever the fit; a bad slope can only move credit between
+   a rollout's own stages. Three guards:
+     - each rollout's slope is fit without its own return (leave-one-out),
+       so no outcome helps set the slope that credits it;
+     - a slope t = b / se standard errors from zero is scaled by
+       t^2 / (t^2 + score_shrinkage), so a noisy fit decays to phi = 0,
+       which is this rule unshaped;
+     - moments are taken about each group's own means and summed, so groups
+       sharing a ``pool`` key share a within-group slope that their
+       differences in level cannot confound. A key's moments come only from
+       earlier groups, decayed by score_decay per group.
+
 Why the TD error: with "entered stage k" as the state and the stage's tokens
 as the action, delta is the actor-critic advantage with the group mean as the
 critic; GRPO is the one-stage case. It charges a stage only for what it
@@ -119,6 +145,15 @@ or to put stage rewards on unrelated scales on an equal footing. With it on,
 the lambda sum mixes per-stage-normalized deltas, so 1 is exactly
 G[i,k] - V_k only off.
 
+``score_shrinkage`` (default 1) and ``score_decay`` (default 0.9) act only on
+scored stages. A group fit from 8 to 16 completers is noisy, with a slope
+standard error of about sd(residual) / (sd(x) * sqrt(n)), and shrinkage
+turns that noise into a bias toward no shaping rather than toward a wrong
+slope. A fit from this group alone is never stale: it describes the same
+policy that produced the returns it redistributes. A pooled fit trades that
+for lower noise, and ``score_decay`` sets the trade: a key remembers about
+1 / (1 - score_decay) groups.
+
 How to write ``reward`` and ``value`` from an env — what each answers, when
 to override the reward default, how to calibrate a value, a worked record —
 is in ``docs/algorithms.md`` under "Writing the record".
@@ -126,6 +161,8 @@ is in ``docs/algorithms.md`` under "Writing the record".
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import verifiers.v1 as vf
@@ -134,9 +171,120 @@ from prime_rl.configs.algorithm import TemporalGRPOContinuousAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm, iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import assign_advantages
 from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, grpo_credit, stage_records
+from prime_rl.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from prime_rl.orchestrator.clients import InferenceClient
+
+
+@dataclass(frozen=True)
+class Moments:
+    """Second moments of (score, downstream return) about each group's own
+    means, summed over groups, so a pooled slope is never confounded by groups
+    that differ in level."""
+
+    dof: float = 0.0  # sum over groups of (points - 1)
+    xx: float = 0.0
+    xy: float = 0.0
+    yy: float = 0.0
+
+    @classmethod
+    def of(cls, points: list[tuple[float, float]]) -> Moments:
+        if len(points) < 2:
+            return cls()
+        mean_x = sum(x for x, _ in points) / len(points)
+        mean_y = sum(y for _, y in points) / len(points)
+        return cls(
+            len(points) - 1,
+            sum((x - mean_x) ** 2 for x, _ in points),
+            sum((x - mean_x) * (y - mean_y) for x, y in points),
+            sum((y - mean_y) ** 2 for _, y in points),
+        )
+
+    def __add__(self, other: Moments) -> Moments:
+        return Moments(self.dof + other.dof, self.xx + other.xx, self.xy + other.xy, self.yy + other.yy)
+
+    def decayed(self, decay: float) -> Moments:
+        return Moments(decay * self.dof, decay * self.xx, decay * self.xy, decay * self.yy)
+
+    def slope(self) -> tuple[float, float]:
+        """Least-squares slope of return on score and its standard error; (0, inf) when undetermined."""
+        if self.xx <= 0.0 or self.dof < 2:
+            return 0.0, math.inf
+        slope = self.xy / self.xx
+        residual = max(self.yy - slope * self.xy, 0.0)
+        return slope, math.sqrt(residual / (self.dof - 1) / self.xx)
+
+
+def shrunk(slope: float, se: float, shrinkage: float) -> float:
+    """A slope t = slope / se standard errors from zero keeps t^2 / (t^2 + shrinkage) of itself."""
+    if slope == 0.0:
+        return 0.0
+    return slope * slope**2 / (slope**2 + shrinkage * se**2)
+
+
+def collected_rewards(record: StageRecord, num_intermediate: int) -> list[float]:
+    """Reward collected in each entered stage; the stage the rollout ended in also pays the task reward."""
+    num_stages = num_intermediate + 1
+    entered = min(len(record.boundaries) + 1, num_stages)
+    q = [record.stage_reward(k) for k in range(1, min(entered, num_intermediate) + 1)]
+    if entered == num_stages:
+        q.append(0.0)
+    q[-1] += record.reward
+    return q
+
+
+def score_pools(records: list[StageRecord], num_intermediate: int) -> dict[int, str | None] | None:
+    """The pool key of each scored stage, or None when a stage's completers
+    disagree on whether it is scored or on its key."""
+    pools: dict[int, str | None] = {}
+    for k in range(1, num_intermediate + 1):
+        completers = [record for record in records if len(record.boundaries) >= k]
+        scored = {record.stage_score(k) is not None for record in completers}
+        keys = {record.stage_pool(k) for record in completers}
+        if len(scored) > 1 or len(keys) > 1:
+            return None
+        if scored == {True}:
+            pools[k] = keys.pop()
+    return pools
+
+
+def fit_handoff_values(
+    records: list[StageRecord],
+    num_intermediate: int,
+    priors: dict[int, Moments],
+    *,
+    shrinkage: float = 1.0,
+) -> tuple[list[StageRecord], dict[int, Moments]]:
+    """Fill each scored stage's handoff values from its completers' scores.
+
+    For every intermediate stage whose completers carry a ``score``, regress
+    their raw downstream return on it, with ``priors[k]`` (moments pooled from
+    earlier groups) added to this group's, and set each completer's value to
+    the shrunk slope times its score's deviation from the completers' mean.
+    Each rollout's slope leaves its own return out. Returns the records with
+    those values filled in and each scored stage's moments from this group.
+    """
+    returns = [collected_rewards(record, num_intermediate) for record in records]
+    values = [[record.stage_value(k) for k in range(1, len(record.boundaries) + 1)] for record in records]
+    moments: dict[int, Moments] = {}
+    for k in range(1, num_intermediate + 1):
+        points: dict[int, tuple[float, float]] = {}
+        for i, record in enumerate(records):
+            score = record.stage_score(k)
+            if score is not None:
+                points[i] = (score, sum(returns[i][k:]))
+        if not points:
+            continue
+        mean_score = sum(x for x, _ in points.values()) / len(points)
+        prior = priors.get(k, Moments())
+        for i, (score, _) in points.items():
+            others = Moments.of([point for j, point in points.items() if j != i])
+            slope = shrunk(*(prior + others).slope(), shrinkage)
+            values[i][k - 1] = slope * (score - mean_score)
+        moments[k] = Moments.of(list(points.values()))
+    filled = [replace(record, stage_values=v) for record, v in zip(records, values, strict=True)]
+    return filled, moments
 
 
 def stage_advantages(
@@ -159,13 +307,10 @@ def stage_advantages(
     """
     num_stages = num_intermediate + 1
     entered = [min(len(record.boundaries) + 1, num_stages) for record in records]
-    # rewards[i][k - 1]: reward collected in stage k. The stage a rollout ended in also pays the task reward.
+    # rewards[i][k - 1]: reward collected in stage k, shaped by the handoff values.
     rewards: list[list[float]] = []
     for record, n in zip(records, entered, strict=True):
-        q = [record.stage_reward(k) for k in range(1, min(n, num_intermediate) + 1)]
-        if n == num_stages:
-            q.append(0.0)
-        q[-1] += record.reward
+        q = collected_rewards(record, num_intermediate)
         # Potential shaping: a stage is paid the value of the state it hands off and charged the value it received.
         for k in range(1, n + 1):
             q[k - 1] += record.stage_value(k) - record.stage_value(k - 1)
@@ -216,6 +361,9 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
         self.std_normalize = config.std_normalize
         self.stage_lambda = config.stage_lambda
         self.success_threshold = config.success_threshold
+        self.score_shrinkage = config.score_shrinkage
+        self.score_decay = config.score_decay
+        self.pooled: dict[str, Moments] = {}  # per ``pool`` key: score moments from earlier groups, decayed
 
     async def score_group(self, episodes: list[vf.Episode]) -> None:
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
@@ -225,6 +373,21 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
         if group is None:
             return grpo_credit(traces)
         records, stage_names = group
+        pools = score_pools(records, len(stage_names))
+        if pools is None:
+            get_logger().debug(
+                "temporal_grpo_continuous: plain GRPO credit for group (stage scores or pool keys differ within the group)"
+            )
+            return grpo_credit(traces)
+        priors = {k: self.pooled.get(key, Moments()) for k, key in pools.items() if key is not None}
+        records, moments = fit_handoff_values(records, len(stage_names), priors, shrinkage=self.score_shrinkage)
+        self._record_fits(traces, stage_names, pools, priors, moments)
+        updates: dict[str, Moments] = {}
+        for k, key in pools.items():
+            if key is not None:
+                updates[key] = updates.get(key, Moments()) + moments[k]
+        for key, group_moments in updates.items():
+            self.pooled[key] = self.pooled.get(key, Moments()).decayed(self.score_decay) + group_moments
         per_token = stage_advantages(
             records,
             len(stage_names),
@@ -233,3 +396,28 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
         )
         for trace, values in zip(traces, per_token, strict=True):
             assign_advantages(trace, values)
+
+    @staticmethod
+    def _record_fits(
+        traces: list[vf.Trace],
+        stage_names: list[str],
+        pools: dict[int, str | None],
+        priors: dict[int, Moments],
+        moments: dict[int, Moments],
+    ) -> None:
+        """Log each scored stage's slope (this group alone, and pooled when keyed).
+        A slope within about one standard error of zero is noise the shrinkage
+        is discarding; a negative one says the score predicts worse outcomes."""
+        fits: dict[str, float] = {}
+        for k, key in pools.items():
+            name = stage_names[k - 1]
+            slope, se = moments[k].slope()
+            if math.isfinite(se):
+                fits[f"stage/{name}/score_slope"] = slope
+                fits[f"stage/{name}/score_slope_se"] = se
+            if key is not None:
+                pooled_slope, pooled_se = (priors[k] + moments[k]).slope()
+                if math.isfinite(pooled_se):
+                    fits[f"stage/{name}/score_slope_pooled"] = pooled_slope
+        for trace in traces:
+            trace.record_metrics(fits)

@@ -313,6 +313,12 @@ class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
     success_threshold: float = 1.0
     """Reward at or above which a rollout counts as a task success — used only to reject groups whose stage record contradicts the reward. Compared against ``trace.reward`` alone, not the stage-reward sum."""
 
+    score_shrinkage: float = Field(1.0, ge=0.0)
+    """How hard a stage's fitted score slope is pulled toward zero, i.e. toward no shaping. A slope t standard errors from zero keeps t² / (t² + score_shrinkage) of itself; 0 trusts every fit. Acts only on stages whose record entries carry a ``score``."""
+
+    score_decay: float = Field(0.9, ge=0.0, lt=1.0)
+    """Per-group decay of the score moments shared under a record's ``pool`` key: a key remembers about 1 / (1 - score_decay) groups. Shorter memory tracks a changing policy; longer memory averages out noise. Acts only on entries that carry a ``pool``."""
+
 
 class HierarchicalGRPOAlgoConfig(BaseAlgoConfig):
     type: Literal["hierarchical_grpo"] = "hierarchical_grpo"
