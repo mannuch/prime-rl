@@ -503,8 +503,8 @@ Add handoff signals on top of the stage rewards in this order, stopping once the
 With a `value` or `score` in place, λ also decides what that signal does: each handoff a stage is paid is scaled by (1 − λ), while the charge to the next stage keeps full weight. In practice:
 
 - **Start at λ = 0.** The signal then carries the downstream credit itself, so its calibration matters. Raise λ only if the handoff diagnostic (a stage improving while the next one gets worse) still fires with the signal in place.
-- **If you have a measurement but no calibration, write a `score`, not a rough `value`.** The group fits the scale for you, and that works under the default settings.
-- **High λ does not make a rough `value` safe under the default settings.** With `std_normalize = true`, each handoff is paid at one stage's scale and charged at the next's, so it keeps carrying credit at every λ and a miscalibrated `value` still distorts it. Only with `std_normalize = false` does a `value` at λ = 1 act purely as a baseline for the next stage, where a wrong scale costs variance but never bias.
+- **If you have a measurement but no calibration, write a `score`, not a rough `value`.** The group fits the scale for you, whatever `std_normalize` is set to.
+- **High λ makes a rough `value` safe only with `std_normalize = false`, the default.** There, a `value` at λ = 1 acts purely as a baseline for the next stage, where a wrong scale costs variance but never bias. With `std_normalize = true`, each handoff is paid at one stage's scale and charged at the next's, so it keeps carrying credit at every λ and a miscalibrated `value` still distorts it.
 
 ```toml
 [orchestrator.train.algo]

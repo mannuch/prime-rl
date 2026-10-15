@@ -187,17 +187,17 @@ only if the symptom persists.
 
 ``std_normalize`` (default off) divides each stage's credits by their std over
 the stage's entrants. Off, credit stays in reward units: conservation (4)
-holds, a stage that decides more of the return gets more weight, and this
-matches prime-rl's GRPO and ``temporal_grpo``, neither of which normalizes by
-default. On, every stage that separates its entrants contributes unit-scale
-signal, whatever its reward scale or entrant count, and with binary rewards
-this is exactly the paper's rule (5). The cost of on: a late stage with few
-entrants, or continuous rewards that differ only by noise, get that noise
-blown up to full size, and 4 no longer holds, so a stage's weight stops
-reflecting how much it moves the return. Turn it on to reproduce the paper,
-or to put stage rewards on unrelated scales on an equal footing. With it on,
-the lambda sum mixes per-stage-normalized deltas, so 1 is exactly
-G[i,k] - V_k only off.
+holds, a stage that decides more of the return gets more weight, the lambda
+results of 9 hold exactly, and this matches prime-rl's GRPO and
+``temporal_grpo``, neither of which normalizes by default. On, every stage
+that separates its entrants contributes unit-scale signal, whatever its
+reward scale or entrant count, and with binary rewards this is exactly the
+paper's rule (5). The cost of on: a late stage with few entrants, or
+continuous rewards that differ only by noise, get that noise blown up to
+full size; 4 no longer holds, so a stage's weight stops reflecting how much
+it moves the return; and the cancellation of 9 fails. Turn it on to
+reproduce the paper, or to put stage rewards on unrelated scales on an
+equal footing.
 
 ``score_shrinkage`` (default 1) and ``score_decay`` (default 0.9) act only on
 scored stages. A group fit from 8 to 16 completers is noisy, with a slope
