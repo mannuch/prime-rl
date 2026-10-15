@@ -479,9 +479,9 @@ Don't start with `value` if all you have is a ranking or a measurement with no k
 
 **The handoff diagnostic.** Watch each stage's mean reward, and the next stage's mean reward among the rollouts that entered it. If the first rises while the second falls, the stage is getting better at its own job in a way that hurts the next one: a handoff effect the record isn't expressing yet, which a `score` or `value` is the place to express.
 
-Otherwise, add handoff signals in this order, stopping once the handoff diagnostic stops firing:
+Otherwise, add handoff signals on top of the stage rewards in this order, stopping once the handoff diagnostic stops firing:
 
-1. Nothing: completion marks and, where useful, stage rewards.
+1. No handoff signal: stage rewards and completion marks alone. This is the rule's base case and often enough. Write a `reward` wherever a stage's quality is graded; pass/fail stages can keep the default of 1 or 0.
 2. `score`, fit per group.
 3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
 4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
