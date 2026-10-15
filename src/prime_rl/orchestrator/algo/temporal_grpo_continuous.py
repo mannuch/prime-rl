@@ -48,16 +48,23 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
    that earned it. The paper's Stage-Reward GRPO baseline instead broadcasts
    this one value over every token.
 
-5. Paper reduction. With default stage rewards and a binary task reward,
-   q[i,k] is the paper's outcome R[i,k], and mu_k = p_k for k < K, so
+5. Paper reduction. With default stage rewards, a completer of stage k < K
+   collects 1 and a rollout failing it collects its task reward r_f, so
+   with the paper's outcome R[i,k] = c[i,k] and mu_k = p_k + (1 - p_k) r_f,
 
-       delta[i,k] = (1 + V_{k+1}) * (R[i,k] - mu_k)
+       delta[i,k] = (1 - r_f + V_{k+1}) * (R[i,k] - mu_k)
 
-   The factor is shared by stage k's entrants, so dividing by their std
-   (``std_normalize``) gives the paper's (R[i,k] - mu_k) / sigma_k (Eq. 23).
-   The factor is at least 1. A default stage reward of 0 would leave only
-   V_{k+1}, which is 0 in a group where every rollout fails the task, and
-   would erase the signal in the groups the method exists for.
+   whenever every rollout failing stage k has the same r_f (a binary task
+   reward gives r_f = 0). The factor is shared by stage k's entrants, so
+   dividing by their std (``std_normalize``) gives the paper's
+   (R[i,k] - mu_k) / sigma_k (Eq. 23) as long as it is positive, i.e. as
+   long as completing the stage is worth more than failing it; where it is
+   not, this rule reverses the paper's sign and is right to. The factor is
+   at least 1 for a binary task reward. A default stage reward of 0 would
+   leave only V_{k+1}, which is 0 in a group where every rollout fails the
+   task, and would erase the signal in the groups the method exists for.
+   Failures with differing partial credit break the reduction: their quality
+   terms then differ, which is the point of a stage reward.
 
 6. Lambda. A[i,n_i] = delta[i,n_i] and A[i,k] = delta[i,k] + stage_lambda *
    A[i,k+1]. At 0 a stage answers only for its reward and the state it hands
@@ -73,13 +80,19 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
 
    with phi_0 = 0 and phi = 0 for a failed stage and for K. This is
    potential-based shaping: the potentials telescope, so the return and 4 are
-   unchanged, and phi == 0 is this rule exactly. At stage_lambda 0 the dropped
-   term shrinks to E[V(s_{k+1}) - phi_k | a_k], the carry-forward phi fails to
-   predict; with phi = V the estimator is the one-step advantage under an
-   exact critic. Each stage is judged on what it added to the state it
-   received, not on what it inherited. phi is in reward units: a score of
-   beta * V leaves (1 - beta) of the bias, and ``std_normalize`` rescales
-   delta, not phi against q.
+   unchanged, and phi == 0 is this rule exactly. Expanding,
+
+       delta'[i,k] = delta[i,k] + c[i,k] * (phi_k - mean phi_k over E_{k+1})
+                                - (phi_{k-1} - mean phi_{k-1} over E_k)
+
+   so only phi's deviations within a stage matter, and 3 still holds. At
+   stage_lambda 0 the dropped term shrinks to the centered
+   E[V(s_{k+1}) - phi_k | a_k], the carry-forward phi fails to predict; with
+   phi = V the estimator is the one-step advantage under an exact critic, up
+   to the sampling error of the group means. Each stage is judged on what it
+   added to the state it received, not on what it inherited. phi is in
+   reward units: a score of beta * V leaves (1 - beta) of the bias, and
+   ``std_normalize`` rescales delta, not phi against q.
 
 8. Fitted handoff values. A completed entry may carry a ``score`` x instead,
    any measurement of the handoff state, on any scale. Over stage k's

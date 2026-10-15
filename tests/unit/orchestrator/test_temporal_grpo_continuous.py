@@ -2,6 +2,7 @@
 
 import itertools
 import math
+import random
 
 import pytest
 
@@ -41,16 +42,80 @@ LATE_FAILURE = [
 ]
 
 
-def test_binary_stages_reproduce_temporal_grpo():
+@pytest.mark.parametrize("failure_reward", [0.0, -1.0])
+def test_binary_stages_reproduce_temporal_grpo(failure_reward):
     # Every group of 4 over the binary outcomes of 2 intermediate stages + a task reward
     # (all-fail, all-pass, single-entrant and mixed groups included): per-stage
-    # normalization cancels the (1 + V[k+1]) factor, leaving the paper's rule.
-    states = [([], 0.0), ([10], 0.0), ([10, 20], 0.0), ([10, 20], 1.0)]
+    # normalization cancels the (1 - r_fail + V[k+1]) factor, leaving the paper's rule,
+    # for any task reward shared by the rollouts failing a stage.
+    states = [([], failure_reward), ([10], failure_reward), ([10, 20], 0.0), ([10, 20], 1.0)]
     for group in itertools.product(states, repeat=4):
         records = [StageRecord(list(boundaries), 30, reward) for boundaries, reward in group]
         expected = binary.stage_advantages(records, 2, std_normalize=True)
         for actual, paper in zip(stage_advantages(records, 2, std_normalize=True), expected, strict=True):
             assert actual == pytest.approx(paper, abs=1e-4)
+
+
+def test_derivation_identities_on_random_groups():
+    # The docstring's steps 1, 3, 4, 6 and 7, checked against the code on random groups with
+    # failures, continuous stage and task rewards, and handoff values.
+    rng = random.Random(0)
+    for _ in range(60):
+        num_intermediate, size = rng.randint(0, 3), rng.randint(1, 8)
+        num_stages = num_intermediate + 1
+        records = []
+        for _ in range(size):
+            completed = rng.randint(0, num_intermediate)
+            entered = min(completed + 1, num_intermediate)
+            records.append(
+                StageRecord(
+                    [10 * (k + 1) for k in range(completed)],
+                    10 * num_stages,
+                    rng.uniform(-1, 2),
+                    [rng.uniform(-1, 1) for _ in range(entered)],
+                    [rng.uniform(-1, 1) for _ in range(completed)],
+                )
+            )
+        n = [min(len(r.boundaries) + 1, num_stages) for r in records]
+        # q with the potentials folded in, G, and the group statistics, straight from the definitions
+        q = []
+        for r, n_i in zip(records, n, strict=True):
+            q_i = [r.stage_reward(k) for k in range(1, min(n_i, num_intermediate) + 1)] + (
+                [0.0] if n_i == num_stages else []
+            )
+            q_i[-1] += r.reward
+            q.append([q_i[k - 1] + r.stage_value(k) - r.stage_value(k - 1) for k in range(1, n_i + 1)])
+        G = [[sum(q_i[k - 1 :]) for k in range(1, n_i + 1)] for q_i, n_i in zip(q, n, strict=True)]
+        V, mu, p = [0.0] * (num_stages + 2), [0.0] * (num_stages + 2), [0.0] * (num_stages + 2)
+        for k in range(num_stages, 0, -1):  # downward, so V[k + 1] is known when V[k] is checked
+            entrants = [i for i in range(size) if n[i] >= k]
+            if entrants:
+                V[k] = sum(G[i][k - 1] for i in entrants) / len(entrants)
+                mu[k] = sum(q[i][k - 1] for i in entrants) / len(entrants)
+                p[k] = sum(n[i] > k for i in entrants) / len(entrants)
+                assert V[k] == pytest.approx(mu[k] + p[k] * V[k + 1])  # step 1
+        delta = [
+            [q[i][k - 1] + (V[k + 1] if k < n[i] else 0.0) - V[k] for k in range(1, n[i] + 1)] for i in range(size)
+        ]
+        for k in range(1, num_stages + 1):
+            assert sum(delta[i][k - 1] for i in range(size) if n[i] >= k) == pytest.approx(0.0, abs=1e-9)  # step 3
+        raw = [
+            sum(r.stage_reward(k) for k in range(1, min(n_i, num_intermediate) + 1)) + r.reward
+            for r, n_i in zip(records, n, strict=True)
+        ]
+        for i, r in enumerate(records):
+            assert sum(delta[i]) == pytest.approx(
+                raw[i] - sum(raw) / size
+            )  # step 4, on the raw return: step 7 telescopes
+        adv = stage_advantages(records, num_intermediate, std_normalize=False)
+        adv_one = stage_advantages(records, num_intermediate, std_normalize=False, stage_lambda=1.0)
+        for i, r in enumerate(records):
+            assert stage_values(r, adv[i]) == pytest.approx(
+                delta[i][: len(stage_values(r, adv[i]))]
+            )  # step 2 is the code
+            assert stage_values(r, adv_one[i]) == pytest.approx(
+                [G[i][k - 1] - V[k] for k in range(1, n[i] + 1)][: len(stage_values(r, adv_one[i]))]
+            )  # step 6
 
 
 def test_late_failure_keeps_early_credit():
