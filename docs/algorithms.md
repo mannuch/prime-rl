@@ -423,9 +423,42 @@ Every trace in a group must report the same stage list; a group with a missing o
 
 `temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward instead and credits a stage with its TD error against the group's stage values. A stage's value `V_k` is the mean reward-to-go of the rollouts that entered it; stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k*. That is the policy gradient of the rollout's return with the group as critic, applied at every stage node (plain GRPO is the one-stage case): unnormalized, a rollout's stage advantages sum to its return minus the group mean, so this redistributes GRPO's credit to the stages that earned it rather than changing the objective. By default each stage's TD errors are divided by their std over the stage's entrants (`std_normalize = true`); with binary stage rewards that makes it exactly `temporal_grpo`'s rule, in every group.
 
-The record is the same one; a stage's `reward` defaults to its binary outcome (1 if completed, 0 if not), and the env overrides it with a quality score, partial credit on a failed stage, or anything else measurable. The task reward is paid in the stage the rollout ended in: the final stage when every intermediate stage was completed, otherwise the stage it failed. So a rollout's return is its stage rewards plus the task reward, with no double counting as long as the rubric doesn't also sum the stage rewards. A completed stage with an explicit `reward` of 0 still earns the next stage's group value: completion is structural, the reward is only the scalar.
+The derivation, including why the TD error and what handoff values do to it, is in the module docstring of `temporal_grpo_continuous.py`.
 
-The rule prices every handoff out of stage *k* at the same `V_{k+1}`, so it can't see when one rollout's stage-*k* work left a better state for stage *k+1* than another's: a grasp that holds but slips in transport, a patch that passes `reproduce` but makes `verify` harder. When the env can score that, a completed entry may carry a `value`: its estimate, in reward units, of the return still expected from the state the stage handed off (for a success-or-nothing task, the probability of eventual success from there). The stage is paid its `value` and the next stage is charged it, so the potentials telescope, the return and the conservation property are unchanged, and each stage is judged on what it *added* to the state it received rather than on what it inherited. With an exact `value` the λ=0 rule becomes the one-step advantage under an exact critic; with an approximate one, what remains unaccounted for is only the part of the carry-forward the score fails to predict. The scale matters: a score of half the true value leaves half the gap, and normalization doesn't fix that. A `value` on a failed stage makes the record malformed, since a failed stage hands nothing off.
+#### Writing the record
+
+The record is the same `trace.info["stages"]` list `temporal_grpo` reads: the task's ordered intermediate stages, each with a `name` and a completion mark (`node` or `token`, `None` if never completed). The task stage is implicit and is paid `trace.reward`. Two optional scalars on an entry shape the credit.
+
+**`reward` answers "what did this stage earn?"** It is the piece of the return the stage is responsible for, in `trace.reward`'s units. The default, 1 if completed and 0 if not, makes completing stages the objective in groups where nobody succeeds, and is the right default for stages that are pass/fail. Override it when:
+
+- completion is graded: a 0.7 repro and a 0.3 repro both "complete";
+- a failed stage still earned something: put partial credit on the failed entry;
+- stages are always completed: the default then pays everyone 1 and says nothing.
+
+Stage rewards add to `trace.reward`; the return this rule optimizes is their sum. Don't also fold them into the rubric, or they count twice. `success_threshold` reads `trace.reward` alone. A completed stage with an explicit `reward` of 0 still earns the next stage's group value: completion is structural, the reward is only the scalar.
+
+**`value` answers "from the state this stage handed off, how much is still to be earned?"** It is a forecast, not a grade: for a success-or-nothing task, the probability of eventual success from here times the task reward, plus any stage rewards still ahead. It goes only on completed entries; a `value` on a failed stage makes the record malformed, since a failed stage hands nothing off. The stage is paid its `value` and the next stage is charged it, so it moves credit between neighbours and never changes the total: each stage is judged on how much it improved the outlook it was handed, not on what it inherited. Reward measures the stage, value measures the state after it; a stage that did its work but left a mess has high reward and low value.
+
+Reach for `value` when a stage can complete well or badly in ways the next stage feels (a grasp that holds but is off-centre, a repro that fails on the wrong assertion), or when stages are always completed, so only a quality signal can tell their tokens apart. Without it, the rule prices every handoff out of stage *k* at the same `V_{k+1}` and can't see those differences.
+
+Two rules for `value`:
+
+- **Compute it from the handoff state alone**, not from what happened afterwards. A value that peeks at the outcome leaks it back into earlier stages, which is `stage_lambda = 1` with extra steps.
+- **Calibrate it.** Among rollouts handed a value of *v*, about *v* of the remaining return should be realised on average. Half the true value leaves half the carry-forward unaccounted for, double it over-corrects, and `std_normalize` repairs neither. A heuristic that only ranks handoffs needs a mapping to reward units before it is a value. If you can't calibrate, leave `value` off and split the stage or raise `stage_lambda` a little instead.
+
+A record for reproduce → patch → verify, with `trace.reward = 0`:
+
+```python
+interaction.trace.info["stages"] = [
+    {"name": "reproduce", "node": 4, "value": 0.6},
+    {"name": "patch", "node": 11, "reward": 0.8, "value": 0.9},
+    {"name": "verify", "node": None, "reward": 0.2},
+]
+```
+
+reproduce completed (reward 1 by default) and left a state worth 0.6; patch completed with quality 0.8 and raised the outlook to 0.9; verify failed, earning 0.2, and the task reward 0 lands there. After shaping the stages pay 1.6, 1.1 and −0.7: verify is charged for the 0.9 outlook it squandered. The total, 2.0, is the raw sum, as it always is.
+
+Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and `value` is the place to express it.
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
 
