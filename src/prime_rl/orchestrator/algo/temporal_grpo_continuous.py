@@ -146,8 +146,12 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
    argument needs phi[i,k-1] to depend on nothing rollout i did after stage
    k - 1: for a value, that it is computed from the handoff state alone; for
    a fitted score, the leave-one-out of 8. With ``std_normalize`` each stage
-   is rescaled before the sum, so the (1 - lambda) cancellation is exact
-   only unnormalized.
+   is rescaled before the sum: psi[i,j] is paid at stage j's scale and
+   charged at stage j + 1's, so it cancels only to the extent neighbouring
+   stages' scales agree, and the baseline argument at lambda = 1 fails with
+   it (two rollouts with the same start but different handoffs then get
+   different stage-(j + 1) credit). To lean on either, turn
+   ``std_normalize`` off.
 
 Why the TD error: with "entered stage k" as the state and the stage's tokens
 as the action, delta is the actor-critic advantage with the group mean as the
@@ -174,10 +178,11 @@ or raise ``stage_lambda`` so later outcomes flow back, at the cost of
 variance and some of the aliasing the method removes.
 1 gives each stage its full remaining return, G[i,k] - V_k. With a value or
 score in place, 9 says what ``stage_lambda`` does to it: at 0 the signal
-carries the carry-forward and its calibration matters; near 1 it is only a
-baseline for the next stage, so a miscalibrated one costs variance, never
-bias. Start at 0 with a signal in place, and raise it only if the symptom
-persists.
+carries the carry-forward and its calibration matters; near 1, with
+``std_normalize`` off, it is only a baseline for the next stage, so a
+miscalibrated one costs variance, never bias (normalized, it keeps carrying
+credit at every lambda). Start at 0 with a signal in place, and raise it
+only if the symptom persists.
 
 ``std_normalize`` (default off) divides each stage's credits by their std over
 the stage's entrants. Off, credit stays in reward units: conservation (4)
