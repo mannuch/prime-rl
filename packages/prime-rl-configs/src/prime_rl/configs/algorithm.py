@@ -2,7 +2,8 @@
 
 An algorithm is a named, self-contained config — a discriminated union keyed
 on ``type`` (``grpo``, ``max_rl``, ``rae``, ``hierarchical_grpo``,
-``temporal_grpo``, ``opd``, ``opsd``, ``sft``, ``echo``, ``debug``).
+``temporal_grpo``, ``temporal_grpo_continuous``, ``opd``, ``opsd``, ``sft``,
+``echo``, ``debug``).
 The bundle *is* the algorithm: each variant carries
 its sampling component and its credit-assignment / loss-routing parameters,
 and its class defaults are the vetted setting — ``type = "opd"`` with a
@@ -283,6 +284,42 @@ class TemporalGRPOAlgoConfig(BaseAlgoConfig):
     """Reward at or above which a rollout counts as a task success — used only to reject groups whose stage record contradicts the reward."""
 
 
+class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
+    type: Literal["temporal_grpo_continuous"] = "temporal_grpo_continuous"
+    """Temporal GRPO with continuous stage rewards. Reads the same stage record
+    as ``temporal_grpo``; each entry may carry a ``reward`` (default: 1 if the
+    stage was completed, 0 if not), and the task reward is paid in the stage
+    the rollout ended in. Stage k's advantage is its reward, plus the group's
+    value of the next stage if it completed k, minus the group's value of
+    stage k — a stage's value being the mean reward-to-go of the rollouts that
+    entered it. With binary stage rewards and ``std_normalize`` on, this is
+    the paper's rule, i.e. ``temporal_grpo`` with ``std_normalize`` on.
+    A completed entry may also carry a ``value``, the env's estimate of the
+    return still expected from the state it handed off; it is paid to that
+    stage and charged to the next, so the return is unchanged and each stage
+    is judged on what it added to the state it received."""
+
+    action_loss_type: ClassVar[ActionLossType] = "rl"
+
+    stage_key: str = "stages"
+    """Key in ``trace.info`` holding the env's ordered intermediate-stage record."""
+
+    std_normalize: bool = False
+    """Divide each stage's TD error by its std over the stage's entrants. Off by default, matching prime-rl's GRPO and ``temporal_grpo``: credit stays in reward units, a rollout's stage advantages sum to its return minus the group mean, and a ``value`` at ``stage_lambda`` = 1 acts only as a baseline. On: every stage contributes unit-scale signal, and with binary stage rewards this is exactly the paper's rule."""
+
+    stage_lambda: float = Field(0.0, ge=0.0, le=1.0)
+    """λ over stages: a stage's advantage is its TD error plus λ times the next stage's. 0 credits each stage only against the group's value of the stage it leads to; 1 credits it with the rollout's full remaining return minus the group value."""
+
+    success_threshold: float = 1.0
+    """Reward at or above which a rollout counts as a task success — used only to reject groups whose stage record contradicts the reward. Compared against ``trace.reward`` alone, not the stage-reward sum."""
+
+    score_shrinkage: float = Field(1.0, ge=0.0)
+    """How hard a stage's fitted score slope is pulled toward zero, i.e. toward no shaping. A slope t standard errors from zero keeps t² / (t² + score_shrinkage) of itself; 0 trusts every fit. Acts only on stages whose record entries carry a ``score``."""
+
+    score_decay: float = Field(0.9, ge=0.0, lt=1.0)
+    """Per-group decay of the score moments shared under a record's ``pool`` key: a key remembers about 1 / (1 - score_decay) groups. Shorter memory tracks a changing policy; longer memory averages out noise. Acts only on entries that carry a ``pool``. The pooled moments live in orchestrator memory and start empty after a restart."""
+
+
 class HierarchicalGRPOAlgoConfig(BaseAlgoConfig):
     type: Literal["hierarchical_grpo"] = "hierarchical_grpo"
     """GRPO for proposer-solver envs.
@@ -420,6 +457,7 @@ AlgoConfig: TypeAlias = Annotated[
     | RAEAlgoConfig
     | HierarchicalGRPOAlgoConfig
     | TemporalGRPOAlgoConfig
+    | TemporalGRPOContinuousAlgoConfig
     | OPDAlgoConfig
     | OPSDAlgoConfig
     | SFTAlgoConfig
@@ -435,6 +473,7 @@ its class defaults are the vetted setting.
 - ``rae`` — reward minus a per-agent EMA baseline (SPIRAL), for multi-agent self-play envs.
 - ``hierarchical_grpo`` — GRPO for proposer-solver envs: solvers are compared within one proposed problem and proposers across proposals. Needs ``episode_agents``.
 - ``temporal_grpo`` — stage-conditioned GRPO: per-stage group comparison among rollouts that entered the stage, credit on that stage's tokens only. Needs an env that records stages in ``trace.info``.
+- ``temporal_grpo_continuous`` — Temporal GRPO with a scalar reward per stage: each stage's credit is its TD error against the group's stage values. Same stage record, with an optional ``reward`` per entry.
 - ``opd`` — on-policy distillation: policy samples, per-token reverse KL against a reference model. Needs ``teacher``.
 - ``opsd`` — SDFT: policy samples, demo-conditioned reverse KL against the live policy (the teacher is the policy itself).
 - ``sft`` — a frozen model samples, the policy trains with CE on its tokens. Needs a frozen ``sampling.source``.

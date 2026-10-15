@@ -96,6 +96,7 @@ The RL entrypoint supports several training algorithms, switched via `[orchestra
 | `rae` | None | [SPIRAL](https://arxiv.org/abs/2506.24119)'s role-conditioned advantage estimation: reward minus a per-agent EMA baseline, for multi-agent self-play envs (e.g. `kuhn-poker`) |
 | `hierarchical_grpo` | None | GRPO for proposer-solver envs: compare solvers only with attempts on the same proposed problem, and compare proposers with the other proposals in the group |
 | `temporal_grpo` | None | [Temporal GRPO](https://arxiv.org/abs/2608.13026): stage-conditioned credit — each stage compares only the rollouts that entered it, and its advantage lands on that stage's tokens. Needs an env that writes `trace.info["stages"]` |
+| `temporal_grpo_continuous` | None | Temporal GRPO with a scalar reward per stage: each stage's credit is its TD error against the group's stage values; with binary stage rewards it is `temporal_grpo`'s rule. Same stage record, with an optional `reward` per entry |
 | `opd` | Required, must be vLLM (needs `prompt_logprobs`) | [On-policy distillation](https://thinkingmachines.ai/blog/on-policy-distillation/): the policy generates rollouts, the trainer minimizes per-token reverse KL to a reference model |
 | `sft` | Required, any OpenAI-compatible endpoint | Hard-distill: a frozen model generates rollouts, the policy trains on its tokens |
 | `opsd` | None — the live policy is its own reference (no deployment) | [SDFT](https://arxiv.org/abs/2601.19897): the model is its own reference conditioned on expert demonstrations |

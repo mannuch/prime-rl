@@ -6,8 +6,8 @@ turns the signal half into runtime objects (the sampling half is interpreted by
 :class:`~prime_rl.orchestrator.envs.TrainEnv`):
 
 - one module per algorithm (``grpo``, ``echo``, ``max_rl``, ``rae``,
-  ``hierarchical_grpo``, ``temporal_grpo``, ``opd``, ``opsd``, ``sft``,
-  ``debug``) — each named
+  ``hierarchical_grpo``, ``temporal_grpo``, ``temporal_grpo_continuous``,
+  ``opd``, ``opsd``, ``sft``, ``debug``) — each named
   class owns its scoring hooks
   (``score_episode`` / ``score_group``) and declares what it needs (loss
   component, a "teacher", ...). One instance per env, built by
@@ -35,6 +35,7 @@ from prime_rl.orchestrator.algo.rae import RAEAlgorithm
 from prime_rl.orchestrator.algo.routing import assign_advantages, stamp_loss_routing
 from prime_rl.orchestrator.algo.sft import SFTDistillAlgorithm
 from prime_rl.orchestrator.algo.temporal_grpo import TemporalGRPOAlgorithm
+from prime_rl.orchestrator.algo.temporal_grpo_continuous import TemporalGRPOContinuousAlgorithm
 
 if TYPE_CHECKING:
     from prime_rl.configs.algorithm import AlgoConfig
@@ -49,6 +50,7 @@ ALGORITHM_CLASSES: dict[str, type[Algorithm]] = {
     "rae": RAEAlgorithm,
     "hierarchical_grpo": HierarchicalGRPOAlgorithm,
     "temporal_grpo": TemporalGRPOAlgorithm,
+    "temporal_grpo_continuous": TemporalGRPOContinuousAlgorithm,
     "opd": OPDAlgorithm,
     "opsd": OPSDAlgorithm,
     "sft": SFTDistillAlgorithm,
@@ -78,6 +80,7 @@ __all__ = [
     "RAEAlgorithm",
     "SFTDistillAlgorithm",
     "TemporalGRPOAlgorithm",
+    "TemporalGRPOContinuousAlgorithm",
     "build_algorithm",
     "assign_advantages",
     "stamp_loss_routing",
