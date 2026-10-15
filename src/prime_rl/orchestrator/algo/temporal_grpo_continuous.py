@@ -105,19 +105,19 @@ or raise ``stage_lambda`` so later outcomes flow back, at the cost of
 variance and some of the aliasing the method removes.
 1 gives each stage its full remaining return, G[i,k] - V_k.
 
-``std_normalize`` (default on) divides each stage's credits by their std over
-the stage's entrants. On, every stage that separates its entrants contributes
-unit-scale signal, whatever its reward scale or entrant count; stage rewards
-on unrelated scales then need no calibration, and with binary rewards this is
-the paper's rule. The cost: a late stage with few entrants, or continuous
-rewards that differ only by noise, get that noise blown up to full size, and
-4 no longer holds, so a stage's weight in the update stops reflecting how much
-it moves the return. Off, credit stays in reward units: conservation holds, a
-stage that decides more of the return gets more weight, and this matches
-prime-rl's GRPO, which does not normalize. Turn it off when stage rewards are
-on one meaningful scale and you want each stage weighted by how much it
-matters; keep it on for binary or mixed-scale rewards. With it on, the lambda
-sum mixes per-stage-normalized deltas, so 1 is exactly G[i,k] - V_k only off.
+``std_normalize`` (default off) divides each stage's credits by their std over
+the stage's entrants. Off, credit stays in reward units: conservation (4)
+holds, a stage that decides more of the return gets more weight, and this
+matches prime-rl's GRPO and ``temporal_grpo``, neither of which normalizes by
+default. On, every stage that separates its entrants contributes unit-scale
+signal, whatever its reward scale or entrant count, and with binary rewards
+this is exactly the paper's rule (5). The cost of on: a late stage with few
+entrants, or continuous rewards that differ only by noise, get that noise
+blown up to full size, and 4 no longer holds, so a stage's weight stops
+reflecting how much it moves the return. Turn it on to reproduce the paper,
+or to put stage rewards on unrelated scales on an equal footing. With it on,
+the lambda sum mixes per-stage-normalized deltas, so 1 is exactly
+G[i,k] - V_k only off.
 
 How to write ``reward`` and ``value`` from an env — what each answers, when
 to override the reward default, how to calibrate a value, a worked record —
@@ -143,7 +143,7 @@ def stage_advantages(
     records: list[StageRecord],
     num_intermediate: int,
     *,
-    std_normalize: bool = True,
+    std_normalize: bool = False,
     stage_lambda: float = 0.0,
     eps: float = 1e-6,
 ) -> list[list[float]]:

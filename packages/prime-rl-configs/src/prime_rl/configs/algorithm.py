@@ -292,7 +292,8 @@ class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
     the rollout ended in. Stage k's advantage is its reward, plus the group's
     value of the next stage if it completed k, minus the group's value of
     stage k — a stage's value being the mean reward-to-go of the rollouts that
-    entered it. With binary stage rewards this is ``temporal_grpo``'s rule.
+    entered it. With binary stage rewards and ``std_normalize`` on, this is
+    the paper's rule, i.e. ``temporal_grpo`` with ``std_normalize`` on.
     A completed entry may also carry a ``value``, the env's estimate of the
     return still expected from the state it handed off; it is paid to that
     stage and charged to the next, so the return is unchanged and each stage
@@ -303,8 +304,8 @@ class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
     stage_key: str = "stages"
     """Key in ``trace.info`` holding the env's ordered intermediate-stage record."""
 
-    std_normalize: bool = True
-    """Divide each stage's TD error by its std over the stage's entrants. With binary stage rewards this is exactly the paper's rule. Off: raw reward-scale credit, where a rollout's stage advantages sum to its return minus the group mean."""
+    std_normalize: bool = False
+    """Divide each stage's TD error by its std over the stage's entrants. Off by default, matching prime-rl's GRPO and ``temporal_grpo``: credit stays in reward units, a rollout's stage advantages sum to its return minus the group mean, and a ``value`` at ``stage_lambda`` = 1 acts only as a baseline. On: every stage contributes unit-scale signal, and with binary stage rewards this is exactly the paper's rule."""
 
     stage_lambda: float = Field(0.0, ge=0.0, le=1.0)
     """λ over stages: a stage's advantage is its TD error plus λ times the next stage's. 0 credits each stage only against the group's value of the stage it leads to; 1 credits it with the rollout's full remaining return minus the group value."""

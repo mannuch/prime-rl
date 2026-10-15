@@ -421,7 +421,7 @@ Every trace in a group must report the same stage list; a group with a missing o
 
 ### Temporal GRPO with continuous stage rewards
 
-`temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward instead and credits a stage with its TD error against the group's stage values. A stage's value `V_k` is the mean reward-to-go of the rollouts that entered it; stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k*. That is the policy gradient of the rollout's return with the group as critic, applied at every stage node (plain GRPO is the one-stage case): unnormalized, a rollout's stage advantages sum to its return minus the group mean, so this redistributes GRPO's credit to the stages that earned it rather than changing the objective. By default each stage's TD errors are divided by their std over the stage's entrants (`std_normalize = true`); with binary stage rewards that makes it exactly `temporal_grpo`'s rule, in every group.
+`temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward instead and credits a stage with its TD error against the group's stage values. A stage's value `V_k` is the mean reward-to-go of the rollouts that entered it; stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k*. That is the policy gradient of the rollout's return with the group as critic, applied at every stage node (plain GRPO is the one-stage case): unnormalized, a rollout's stage advantages sum to its return minus the group mean, so this redistributes GRPO's credit to the stages that earned it rather than changing the objective. By default credit stays in reward units (`std_normalize = false`), like prime-rl's GRPO. Setting `std_normalize = true` divides each stage's TD errors by their std over the stage's entrants; with binary stage rewards that makes it exactly the paper's rule (`temporal_grpo` with `std_normalize = true`), in every group.
 
 The derivation, including why the TD error and what handoff values do to it, is in the module docstring of `temporal_grpo_continuous.py`.
 
@@ -465,7 +465,7 @@ Write the record where you write the completion marks (`Env.run` online or `Task
 ```toml
 [orchestrator.train.algo]
 type = "temporal_grpo_continuous"
-std_normalize = true
+std_normalize = false   # true reproduces the paper's rule for binary stages
 stage_lambda = 0.0   # 1 credits each stage with the rollout's remaining return
 ```
 

@@ -42,26 +42,29 @@ def test_binary_stages_reproduce_temporal_grpo():
     for group in itertools.product(states, repeat=4):
         records = [StageRecord(list(boundaries), 30, reward) for boundaries, reward in group]
         expected = binary.stage_advantages(records, 2, std_normalize=True)
-        for actual, paper in zip(stage_advantages(records, 2), expected, strict=True):
+        for actual, paper in zip(stage_advantages(records, 2, std_normalize=True), expected, strict=True):
             assert actual == pytest.approx(paper, abs=1e-4)
 
 
 def test_late_failure_keeps_early_credit():
     adv = stage_advantages(LATE_FAILURE, 3)
-    assert spans(adv[0]) == [(0.5773, 10), (0.0, 10), (0.7071, 10), (1.0, 10)]
-    assert spans(adv[1]) == [(0.5773, 10), (0.0, 10), (-1.4142, 20)]
-    assert spans(adv[2]) == [(-1.732, 40)]
+    assert spans(adv[0]) == [(0.75, 10), (0.0, 10), (0.5, 20)]
+    assert spans(adv[1]) == [(0.75, 10), (0.0, 10), (-1.0, 20)]
+    assert spans(adv[2]) == [(-2.25, 40)]
     # Vanilla GRPO would give this rollout -0.25 on every token.
-    assert spans(adv[3]) == [(0.5773, 10), (0.0, 10), (0.7071, 10), (-1.0, 10)]
+    assert spans(adv[3]) == [(0.75, 10), (0.0, 10), (0.5, 10), (-0.5, 10)]
 
 
 def test_all_fail_group_still_has_signal():
     # Nobody earns task reward, so the downstream group value is 0; the binary
-    # stage reward keeps stage 1 separating them.
+    # stage reward keeps stage 1 separating them, normalized or not.
     records = [StageRecord([5], 10, 0.0), StageRecord([], 10, 0.0)]
     adv = stage_advantages(records, 1)
-    assert spans(adv[0]) == [(1.0, 5), (0.0, 5)]
-    assert spans(adv[1]) == [(-1.0, 10)]
+    assert spans(adv[0]) == [(0.5, 5), (0.0, 5)]
+    assert spans(adv[1]) == [(-0.5, 10)]
+    normalized = stage_advantages(records, 1, std_normalize=True)
+    assert spans(normalized[0]) == [(1.0, 5), (0.0, 5)]
+    assert spans(normalized[1]) == [(-1.0, 10)]
 
 
 def test_continuous_stage_rewards_conserve_credit():
