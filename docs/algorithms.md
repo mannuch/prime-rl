@@ -468,23 +468,27 @@ A group has 8–16 rollouts, so the fit is noisy. To pool it across groups, give
 
 Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled` when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
 
-**Which to use.** `value` costs no estimation noise and works from a single completer, so when you can write one, it's the better signal. **Start with `value`** when any of these holds:
+Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`).
 
-- **You can compute the forecast.** The env sees the state well enough to know what's left: a simulator with privileged state and a known success model, or remaining work that's fixed arithmetic (say, the stage rewards still ahead, each with a known pass rate from this state).
-- **You can calibrate offline.** You have logged rollouts from an earlier run, or the logged `score_slope`s from a `score`-based one, and can fit the mapping from your measurement to downstream return once, outside training.
-- **The stage is rarely completed by many rollouts in a group.** A per-group fit needs at least 4 completers of the stage before it produces a slope at all (each rollout's fit leaves itself out and needs 3 points), so a late stage that 2 or 3 rollouts in a group reach gets no shaping from a `score` unless it has a `pool` key with history.
-- **Several measurements matter and you know how they combine.** A fit uses one score. If the handoff depends on, say, both test count and diff size in a known way, combine them into a value yourself rather than collapsing them into one uncalibrated number.
+#### Using a `score` instead of a `value`
 
-Don't start with `value` if all you have is a ranking or a measurement with no known scale: a miscalibrated value distorts credit, and `std_normalize` won't correct it. Use `score` and let the group calibrate it.
+Start a stage's handoff signal with a `score`, not a `value`. A `value` has to be calibrated: its differences must equal differences in expected return, which an env that sees one rollout at a time rarely knows. A miscalibrated `value` distorts credit, and `std_normalize` won't correct it. A `score` only has to measure; the group calibrates it.
 
 **The handoff diagnostic.** Watch each stage's mean reward, and the next stage's mean reward among the rollouts that entered it. If the first rises while the second falls, the stage is getting better at its own job in a way that hurts the next one: a handoff effect the record isn't expressing yet, which a `score` or `value` is the place to express.
 
-Otherwise, add handoff signals on top of the stage rewards in this order, stopping once the handoff diagnostic stops firing:
+Add handoff signals on top of the stage rewards in this order, stopping once the handoff diagnostic stops firing:
 
 1. No handoff signal: stage rewards and completion marks alone. This is the rule's base case and often enough. Write a `reward` wherever a stage's quality is graded; pass/fail stages can keep the default of 1 or 0.
 2. `score`, fit per group.
 3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
 4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
+
+**Start directly with `value`** only when any of these holds. A `value` costs no estimation noise and works from a single completer, so when you can write a calibrated one, it's the better signal:
+
+- **You can compute the forecast.** The env sees the state well enough to know what's left: a simulator with privileged state and a known success model, or remaining work that's fixed arithmetic (say, the stage rewards still ahead, each with a known pass rate from this state).
+- **You can calibrate offline.** You have logged rollouts from an earlier run, or the logged `score_slope`s from a `score`-based one, and can fit the mapping from your measurement to downstream return once, outside training.
+- **The stage is rarely completed by many rollouts in a group.** A per-group fit needs at least 4 completers of the stage before it produces a slope at all (each rollout's fit leaves itself out and needs 3 points), so a late stage that 2 or 3 rollouts in a group reach gets no shaping from a `score` unless it has a `pool` key with history.
+- **Several measurements matter and you know how they combine.** A fit uses one score. If the handoff depends on, say, both test count and diff size in a known way, combine them into a value yourself rather than collapsing them into one uncalibrated number.
 
 **When every stage always completes**, the default is still a `score`, but checked sooner. A `score` is easiest to fit here: every rollout completes every stage, so each stage's fit uses the whole group and the few-completers reason to start with a `value` never applies. It also matters more. With no failures there is no progression signal to fall back on, so a `score` that shrinks to zero leaves per-stage GRPO, and with default stage rewards only the final segment trains. Three adjustments:
 
@@ -492,7 +496,7 @@ Otherwise, add handoff signals on top of the stage rewards in this order, stoppi
 2. **Score the handoff state, not the stage's work.** With every rollout a completer, a `score` that is a linear function of the stage's `reward` merges into the quality term, and `std_normalize` cancels it; the same holds for a `value`. Measure where things ended up, not how well the stage scored.
 3. **Look at the logged slope early**, and move to a `pool` key, larger groups or an offline-calibrated `value` sooner than you would when stages can fail.
 
-Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`).
+#### Configuration
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
 

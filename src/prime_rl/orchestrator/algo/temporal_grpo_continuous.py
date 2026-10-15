@@ -208,9 +208,11 @@ policy that produced the returns it redistributes. A pooled fit trades that
 for lower noise, and ``score_decay`` sets the trade: a key remembers about
 1 / (1 - score_decay) groups.
 
-How to write ``reward`` and ``value`` from an env — what each answers, when
-to override the reward default, how to calibrate a value, a worked record —
-is in ``docs/algorithms.md`` under "Writing the record".
+How to write ``reward``, ``value`` and ``score`` from an env — what each
+answers, when to override the reward default, how to calibrate a value, a
+worked record — is in ``docs/algorithms.md`` under "Writing the record";
+which handoff signal to start with is under "Using a ``score`` instead of a
+``value``".
 """
 
 from __future__ import annotations
