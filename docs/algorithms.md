@@ -477,7 +477,9 @@ Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_
 
 Don't start with `value` if all you have is a ranking or a measurement with no known scale: a miscalibrated value distorts credit, and `std_normalize` won't correct it. Use `score` and let the group calibrate it.
 
-Otherwise, add handoff signals in this order, stopping when the diagnostics below stop pointing at a handoff effect:
+**The handoff diagnostic.** Watch each stage's mean reward, and the next stage's mean reward among the rollouts that entered it. If the first rises while the second falls, the stage is getting better at its own job in a way that hurts the next one: a handoff effect the record isn't expressing yet, which a `score` or `value` is the place to express.
+
+Otherwise, add handoff signals in this order, stopping once the handoff diagnostic stops firing:
 
 1. Nothing: completion marks and, where useful, stage rewards.
 2. `score`, fit per group.
@@ -490,13 +492,13 @@ Otherwise, add handoff signals in this order, stopping when the diagnostics belo
 2. **Score the handoff state, not the stage's work.** With every rollout a completer, a `score` that is a linear function of the stage's `reward` merges into the quality term, and `std_normalize` cancels it; the same holds for a `value`. Measure where things ended up, not how well the stage scored.
 3. **Look at the logged slope early**, and move to a `pool` key, larger groups or an offline-calibrated `value` sooner than you would when stages can fail.
 
-Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`). When tuning, watch each stage's mean reward and the next stage's mean reward among its entrants: the first rising while the second falls means a handoff effect the record isn't expressing, and a `score` or `value` is the place to express it.
+Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`).
 
 `stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
 
 With a `value` or `score` in place, λ also decides what that signal does: each handoff a stage is paid is scaled by (1 − λ), while the charge to the next stage keeps full weight. In practice:
 
-- **Start at λ = 0.** The signal then carries the downstream credit itself, so its calibration matters. Raise λ only if the diagnostic above persists with the signal in place.
+- **Start at λ = 0.** The signal then carries the downstream credit itself, so its calibration matters. Raise λ only if the handoff diagnostic (a stage improving while the next one gets worse) still fires with the signal in place.
 - **If you have a measurement but no calibration, write a `score`, not a rough `value`.** The group fits the scale for you, and that works under the default settings.
 - **High λ does not make a rough `value` safe under the default settings.** With `std_normalize = true`, each handoff is paid at one stage's scale and charged at the next's, so it keeps carrying credit at every λ and a miscalibrated `value` still distorts it. Only with `std_normalize = false` does a `value` at λ = 1 act purely as a baseline for the next stage, where a wrong scale costs variance but never bias.
 
