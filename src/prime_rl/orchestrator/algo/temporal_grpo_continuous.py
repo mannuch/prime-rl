@@ -118,6 +118,66 @@ prime-rl's GRPO, which does not normalize. Turn it off when stage rewards are
 on one meaningful scale and you want each stage weighted by how much it
 matters; keep it on for binary or mixed-scale rewards. With it on, the lambda
 sum mixes per-stage-normalized deltas, so 1 is exactly G[i,k] - V_k only off.
+
+For env authors
+---------------
+The record lists the task's ordered *intermediate* stages; the task stage is
+implicit and is paid ``trace.reward``. Each entry has a ``name`` and a
+completion mark (``node`` or ``token``; ``None`` if never completed), as for
+``temporal_grpo``. Two optional scalars shape the credit:
+
+``reward`` answers "what did this stage earn?" It is the piece of the return
+the stage is responsible for, in ``trace.reward``'s units. The default, 1 if
+completed and 0 if not, makes completing stages the objective in groups where
+nobody succeeds; it is the right default for stages that are pass/fail.
+Override it when completion is graded (a 0.7 repro and a 0.3 repro both
+"complete"), when a failed stage still earned something (put partial credit
+on the failed entry), or when stages are always completed, where the default
+pays everyone 1 and so says nothing. Stage rewards add to ``trace.reward``:
+the return this rule optimizes is their sum. Do not also fold them into the
+rubric, or they count twice. ``success_threshold`` reads ``trace.reward``
+alone.
+
+``value`` answers "from the state this stage handed off, how much is still
+to be earned?" It is a forecast, not a grade: for a success-or-nothing task,
+the probability of eventual success from here times the task reward, plus
+any stage rewards still ahead. It goes only on completed entries. The stage
+is paid it and the next stage is charged it, so it moves credit between
+neighbours and never changes the total: a stage is judged on how much it
+improved the outlook it was handed. Reward measures the stage, value
+measures the state after it; a stage that did its work but left a mess has
+high reward and low value. Reach for it when a stage can complete well or
+badly in ways the next stage feels (a grasp that holds but is off-centre, a
+repro that fails on the wrong assertion), or when stages are always
+completed, so that only a quality signal can tell their tokens apart.
+
+Two rules for ``value``. Compute it from the handoff state alone, not from
+what happened afterwards: a value that peeks at the outcome leaks it back
+into earlier stages, which is ``stage_lambda`` = 1 with extra steps. And
+calibrate it: among rollouts handed a value of v, about v of the remaining
+return should be realised on average. Half the true value leaves half the
+carry-forward unaccounted for, double it over-corrects, and ``std_normalize``
+does not repair either. A heuristic that only ranks handoffs needs a mapping
+to reward units before it is a value. If you cannot calibrate, leave
+``value`` off and split the stage or raise ``stage_lambda`` a little instead.
+
+A record for reproduce → patch → verify, with ``trace.reward`` = 0::
+
+    [{"name": "reproduce", "node": 4, "value": 0.6},
+     {"name": "patch", "node": 11, "reward": 0.8, "value": 0.9},
+     {"name": "verify", "node": None, "reward": 0.2}]
+
+reproduce completed (reward 1 by default) and left a state worth 0.6; patch
+completed with quality 0.8 and raised the outlook to 0.9; verify failed,
+earning 0.2, and the task reward 0 lands there. After shaping the stages
+pay 1.6, 1.1 and -0.7: verify is charged for the 0.9 outlook it squandered.
+The total, 2.0, is the raw sum, as it always is.
+
+Write the record where you write the completion marks (``Env.run`` online or
+``Task.finalize`` offline; see ``temporal_grpo``). When tuning, watch each
+stage's mean reward and the next stage's mean reward among its entrants: the
+first rising while the second falls means a handoff effect the record is not
+expressing, and ``value`` is the place to express it.
 """
 
 from __future__ import annotations
