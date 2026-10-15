@@ -439,12 +439,7 @@ Stage rewards add to `trace.reward`; the return this rule optimizes is their sum
 
 **`value` answers "from the state this stage handed off, how much is still to be earned?"** It is a forecast, not a grade: for a success-or-nothing task, the probability of eventual success from here times the task reward, plus any stage rewards still ahead. It goes only on completed entries; a `value` on a failed stage makes the record malformed, since a failed stage hands nothing off. The stage is paid its `value` and the next stage is charged it, so it moves credit between neighbours and never changes the total: each stage is judged on how much it improved the outlook it was handed, not on what it inherited. Reward measures the stage, value measures the state after it; a stage that did its work but left a mess has high reward and low value.
 
-Reach for `value` when a stage can complete well or badly in ways the next stage feels (a grasp that holds but is off-centre, a repro that fails on the wrong assertion), or when stages are always completed, so only a quality signal can tell their tokens apart. Without it, the rule prices every handoff out of stage *k* at the same `V_{k+1}` and can't see those differences.
-
-Two rules for `value`:
-
-- **Compute it from the handoff state alone**, not from what happened afterwards. A value that peeks at the outcome leaks it back into earlier stages, which is `stage_lambda = 1` with extra steps.
-- **Calibrate it.** Among rollouts handed a value of *v*, about *v* of the remaining return should be realised on average. Half the true value leaves half the carry-forward unaccounted for, double it over-corrects, and `std_normalize` repairs neither. A heuristic that only ranks handoffs needs a mapping to reward units before it is a value. If you can't calibrate, leave `value` off and split the stage or raise `stage_lambda` a little instead.
+Reach for `value` when a stage can complete well or badly in ways the next stage feels (a grasp that holds but is off-centre, a repro that fails on the wrong assertion), or when stages are always completed, so only a quality signal can tell their tokens apart. Without it, the rule prices every handoff out of stage *k* at the same `V_{k+1}` and can't see those differences. A `value` must be computed from the handoff state alone and calibrated to reward units; see [Designing a handoff signal](#designing-a-handoff-signal).
 
 A record for reproduce → patch → verify, with `trace.reward = 0`:
 
@@ -495,6 +490,37 @@ Add handoff signals on top of the stage rewards in this order, stopping once the
 1. **Check whether a stricter completion check would split the rollouts.** A stage that always completes may have too loose a predicate. Tightening it ("holds through a shake", not "gripper closed") turns quality into the gate and restores discrete conditioning with no calibration at all; a `score` can still sit on top.
 2. **Score the handoff state, not the stage's work.** With every rollout a completer, a `score` that is a linear function of the stage's `reward` merges into the quality term, and `std_normalize` cancels it; the same holds for a `value`. Measure where things ended up, not how well the stage scored.
 3. **Look at the logged slope early**, and move to a `pool` key, larger groups or an offline-calibrated `value` sooner than you would when stages can fail.
+
+#### Designing a handoff signal
+
+A stage's `reward` and its handoff signal (`score` or `value`) are both numbers on the stage's entry, but they do different jobs:
+
+| | `reward` | `score` / `value` |
+|---|---|---|
+| Answers | What did this stage earn? | How much is still to be earned from the state it handed off? |
+| Effect on the return | Adds to it; the policy is trained to collect it | None; moves credit from the next stage to this one, and the rollout's total is unchanged |
+| On a failed stage | Allowed, as partial credit | Not allowed; a failed stage hands nothing off |
+| If it's wrong | The policy optimizes the wrong thing | Credit for the right objective lands on the wrong stage |
+
+To decide where a quantity goes, ask whether you'd pay for it even if it changed nothing downstream. A clean patch, a fast solve or a well-formed answer: yes, so it's a `reward`. Visible tests passing after a patch or a grasp's offset from centre: you care only because they predict what comes next, so they're a handoff signal. Some quantities are both, and then they're usually two numbers: reward the stage's work, and score the state it left. Don't reuse the `reward` as the `score`. That pays the stage a second time for its own work, at the next stage's expense.
+
+For both `score` and `value`:
+
+- **Measure the handoff state at the boundary.** Compute the signal from what the next stage inherits, at the moment the stage completes. A signal that peeks at what happened afterwards leaks the outcome into earlier stages, which is `stage_lambda = 1` with extra steps.
+- **Make it vary where it matters.** The signal acts only through differences between a stage's completers in a group. If it's the same for all of them it does nothing, and a constant offset changes nothing.
+- **Prefer measurements that are hard to move without doing the work.** The stage is paid for raising the signal, so a policy can learn to inflate it without improving the state, taking credit from the next stage. Tests passing is harder to inflate than lines changed. A fitted `score` catches gaming: its `score_slope` falls or turns negative, and the shaping shrinks with it. A `value` keeps paying for it.
+
+For a `score`:
+
+- **Use one number, roughly linear in what's left.** The fit is a straight line from score to downstream return. Fractions beat counts when tasks differ in size. Take the log of a quantity that spans orders of magnitude, such as diff size. Clip outliers, since one extreme score dominates a least-squares fit. A 0/1 indicator is fine: its slope is the difference in mean downstream return between the two sides.
+- **Scale and direction are free, meaning isn't.** Any units, and higher can be better or worse; the fit sorts that out. Under one `pool` key, though, the score must mean the same thing in every group. If you change how it's computed, change the key.
+
+For a `value`:
+
+- **Forecast the whole remaining return.** That is the task reward plus every later stage's `reward`, including the default 1 for each later stage the rollout will complete. With default stage rewards, a probability of eventual success alone misses those.
+- **Get the differences right, not the level.** Only differences between completers matter, so a value off by a constant is fine. One whose spread is off by a factor is not: half the true spread leaves half the carry-forward unaccounted for, double over-corrects, and `std_normalize` repairs neither. A heuristic that only ranks handoffs needs a mapping to reward units before it's a value; until then, write it as a `score`.
+- **Check the calibration by writing it as a `score`.** The logged `score_slope`, averaged over groups, should sit near 1. Below 1, your values are spread too wide; above 1, too narrow.
+- **Recalibrate as the policy changes.** A value forecasts what the current policy will earn from a state, and as later stages improve, the same handoff becomes worth more. A `value` calibrated once goes stale; a `score` is refit every group.
 
 #### Configuration
 

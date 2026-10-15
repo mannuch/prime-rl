@@ -209,10 +209,10 @@ for lower noise, and ``score_decay`` sets the trade: a key remembers about
 1 / (1 - score_decay) groups.
 
 How to write ``reward``, ``value`` and ``score`` from an env — what each
-answers, when to override the reward default, how to calibrate a value, a
-worked record — is in ``docs/algorithms.md`` under "Writing the record";
-which handoff signal to start with is under "Using a ``score`` instead of a
-``value``".
+answers, when to override the reward default, a worked record — is in
+``docs/algorithms.md`` under "Writing the record"; which handoff signal to
+start with is under "Using a ``score`` instead of a ``value``"; how to design
+and calibrate one is under "Designing a handoff signal".
 """
 
 from __future__ import annotations
