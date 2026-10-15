@@ -80,6 +80,28 @@ def test_continuous_stage_rewards_conserve_credit():
         assert sum(stage_values(record, tokens)) == pytest.approx(total - 0.7)
 
 
+def test_handoff_values_shape_credit():
+    # Everyone completes "reproduce", so without values its tokens get zero credit
+    # (all entrants agree) and the stage can't be told apart from the next one.
+    records = [
+        StageRecord([5], 10, 1.0, stage_values=[0.9]),  # strong repro, success
+        StageRecord([5], 10, 0.0, stage_values=[0.9]),  # strong repro, lost it in the patch
+        StageRecord([5], 10, 0.0, stage_values=[0.2]),  # weak repro, failed
+    ]
+    adv = stage_advantages(records, 1, std_normalize=False)
+    # Equal handoffs earn equal stage-1 credit; the weak handoff is charged for it.
+    assert stage_values(records[0], adv[0]) == pytest.approx([7 / 30, 13 / 30])
+    assert stage_values(records[1], adv[1]) == pytest.approx([7 / 30, -17 / 30])
+    assert stage_values(records[2], adv[2]) == pytest.approx([-14 / 30, 4 / 30])
+    # The potentials telescope: totals are still the raw return minus the group mean (4/3).
+    for record, tokens, total in zip(records, adv, [2.0, 1.0, 1.0], strict=True):
+        assert sum(stage_values(record, tokens)) == pytest.approx(total - 4 / 3)
+    # phi == 0 is the unshaped rule exactly.
+    unshaped = [StageRecord(r.boundaries, r.num_tokens, r.reward) for r in records]
+    zeroed = [StageRecord(r.boundaries, r.num_tokens, r.reward, stage_values=[0.0]) for r in records]
+    assert stage_advantages(zeroed, 1) == stage_advantages(unshaped, 1)
+
+
 def test_stage_lambda_one_is_return_to_go():
     adv = stage_advantages(LATE_FAILURE, 3, std_normalize=False, stage_lambda=1.0)
     assert spans(adv[0]) == [(1.75, 10), (1.0, 20), (0.5, 10)]

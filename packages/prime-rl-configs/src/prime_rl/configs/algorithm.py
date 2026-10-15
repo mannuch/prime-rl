@@ -292,7 +292,11 @@ class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
     the rollout ended in. Stage k's advantage is its reward, plus the group's
     value of the next stage if it completed k, minus the group's value of
     stage k — a stage's value being the mean reward-to-go of the rollouts that
-    entered it. With binary stage rewards this is ``temporal_grpo``'s rule."""
+    entered it. With binary stage rewards this is ``temporal_grpo``'s rule.
+    A completed entry may also carry a ``value``, the env's estimate of the
+    return still expected from the state it handed off; it is paid to that
+    stage and charged to the next, so the return is unchanged and each stage
+    is judged on what it added to the state it received."""
 
     action_loss_type: ClassVar[ActionLossType] = "rl"
 

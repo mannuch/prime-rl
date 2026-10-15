@@ -8,7 +8,8 @@ The record is the one ``temporal_grpo`` reads. An entry may carry ``reward``,
 the scalar earned in that stage; absent, a stage pays 1 when completed and 0
 when not — the paper's binary outcome. The task reward is paid in the stage the
 rollout ended in: the final stage when every intermediate stage was completed,
-otherwise the stage it failed.
+otherwise the stage it failed. A completed entry may also carry ``value``, the
+env's estimate of the return still expected from the state it handed off (7).
 
 Derivation
 ----------
@@ -61,6 +62,24 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
    A[i,k+1]. At 0 a stage answers only for its reward and the state it hands
    off; at 1 it telescopes as in 4 to G[i,k] - V_k, the remaining return.
 
+7. Handoff values. The TD error prices every handoff out of stage k at the
+   same V_{k+1}, so it drops the carry-forward of stage k's actions: the true
+   advantage adds V(s_{k+1}) - V_{k+1}, the value of the state actually handed
+   off. An entry's ``value`` is the env's estimate phi_k of that state's
+   remaining return, and the stage reward becomes
+
+       q'[i,k] = q[i,k] + phi_k - phi_{k-1}
+
+   with phi_0 = 0 and phi = 0 for a failed stage and for K. This is
+   potential-based shaping: the potentials telescope, so the return and 4 are
+   unchanged, and phi == 0 is this rule exactly. At stage_lambda 0 the dropped
+   term shrinks to E[V(s_{k+1}) - phi_k | a_k], the carry-forward phi fails to
+   predict; with phi = V the estimator is the one-step advantage under an
+   exact critic. Each stage is judged on what it added to the state it
+   received, not on what it inherited. phi is in reward units: a score of
+   beta * V leaves (1 - beta) of the bias, and ``std_normalize`` rescales
+   delta, not phi against q.
+
 Why the TD error: with "entered stage k" as the state and the stage's tokens
 as the action, delta is the actor-critic advantage with the group mean as the
 critic; GRPO is the one-stage case. It charges a stage only for what it
@@ -80,10 +99,10 @@ It is wrong when stages complete well or badly in ways the next stage feels:
 a grasp that holds but slips in transport, a patch that passes ``reproduce``
 but makes ``verify`` harder. At 0 those handoffs earn the same credit. The
 symptom is a stage's completion rate rising while the next stage's completion
-rate among its entrants falls. Two fixes, best first: make the stage's
-``reward`` measure the quality of the handoff (or split the stage), so the
-TD error sees it directly; or raise ``stage_lambda`` so later outcomes flow
-back, at the cost of variance and some of the aliasing the method removes.
+rate among its entrants falls. Two fixes, best first: give the stage a
+``value`` (7), or split the stage, so the TD error sees the handoff directly;
+or raise ``stage_lambda`` so later outcomes flow back, at the cost of
+variance and some of the aliasing the method removes.
 1 gives each stage its full remaining return, G[i,k] - V_k.
 
 ``std_normalize`` (default on) divides each stage's credits by their std over
@@ -143,6 +162,9 @@ def stage_advantages(
         if n == num_stages:
             q.append(0.0)
         q[-1] += record.reward
+        # Potential shaping: a stage is paid the value of the state it hands off and charged the value it received.
+        for k in range(1, n + 1):
+            q[k - 1] += record.stage_value(k) - record.stage_value(k - 1)
         rewards.append(q)
 
     # Group value of stage k: mean reward-to-go over its entrants.
