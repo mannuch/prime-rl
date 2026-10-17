@@ -544,19 +544,19 @@ However stale, a handoff signal only moves credit between a rollout's own stages
 
 #### Stages from an environment's clock
 
-A task with no natural milestones can still be staged. Most interactive environments advance on a clock of their own: an opponent's move, a simulated user's turn, a simulator step. Make each tick a stage. Every rollout then completes every tick until its episode ends, which is the always-complete case, so the `score` does all the conditioning.
+A task with no natural milestones can still be staged. Most interactive environments advance on a clock of their own, which ticks at each opponent's move, simulated user's turn or simulator step. End a stage at a tick, every tick or every few. Every rollout then completes every stage until its episode ends, which is the always-complete case, so the `score` does all the conditioning.
 
 Writing the record:
 
-- **List the same ticks in every trace.** Every trace in a group must report the same stage list, so list every tick up to the longest episode the environment allows, except the last, which is the task stage. Mark a tick at the agent's last sampled node before the environment's update.
-- **Leave the tick an episode ends in unmarked.** A game that ends during tick 30 has failed tick 30: its task reward lands on that tick's tokens and is compared with the group's value of playing on. Marking that tick would leave the task reward no tokens to land on.
-- **Write `reward: 0` on every completed tick**, or a real per-tick reward. The default pays 1 per completed tick, which on a clock pays for lasting longer.
-- **Score every completed tick** from the state the environment just produced: an engine's evaluation of the position after the opponent's reply, a user simulator's estimate of how close the user is to done. Without a score the rule is per-tick GRPO, and the outcome never reaches the earlier ticks.
-- **Set `success_threshold = inf`** when an episode can end early in success. Otherwise a win before the last tick reads as a success with unmarked stages, and the group falls back to plain GRPO credit.
+- **List the same stages in every trace.** Every trace in a group must report the same stage list, so list every stage the longest episode the environment allows would reach, except the last, which is the task stage. Mark each stage at the agent's last sampled node before the tick that ends it.
+- **Leave the stage an episode ends in unmarked.** A game that ends during stage 30 has failed stage 30: its task reward lands on that stage's tokens and is compared with the group's value of playing on. Marking that stage would leave the task reward no tokens to land on.
+- **Write `reward: 0` on every completed stage**, or a real per-stage reward. The default pays 1 per completed stage, which on a clock pays for lasting longer.
+- **Score every completed stage** from the state the environment produced at its tick: an engine's evaluation of the position after the opponent's reply, a user simulator's estimate of how close the user is to done. Without a score the rule is per-stage GRPO, and the outcome never reaches the earlier stages.
+- **Set `success_threshold = inf`** when an episode can end early in success. Otherwise a win before the last stage reads as a success with unmarked stages, and the group falls back to plain GRPO credit.
 
 ```python
-# Env.run, one tick per opponent reply: marks[k] is the node index of the agent's last
-# turn before tick k's reply, evals[k] the engine's evaluation after it
+# Env.run, one stage per opponent reply: marks[k] is the node index of the agent's last
+# turn before reply k, evals[k] the engine's evaluation after it
 interaction.trace.info["stages"] = [
     {"name": f"move{k + 1}", "node": marks[k], "reward": 0, "score": evals[k]}
     if k < len(marks)
@@ -565,18 +565,18 @@ interaction.trace.info["stages"] = [
 ]
 ```
 
-Choosing ticks, and when to share a slope:
+Choosing how long a stage is, and when to share a slope:
 
-- **Ticks fall between decisions.** A tick inside a turn splits one decision's tokens between two advantages and asks for a score of a half-written response, so one agent turn is the floor.
-- **Start with fairly coarse ticks and no `pool` key.** Each tick then fits its own slope, which assumes nothing about how the score's meaning changes over the episode and keeps no history. Its limit is noise: if most ticks' `score_slope` sit within one `score_slope_se` of zero, the ticks are finer than the fits can resolve, so coarsen them or improve the score.
-- **Read the per-tick slopes.** They show whether a given change in the score predicts about the same change in outcome at every tick.
+- **End stages between decisions.** A stage boundary inside a turn splits one decision's tokens between two advantages and asks for a score of a half-written response, so one agent turn is the shortest sensible stage.
+- **Start with stages several ticks long and no `pool` key.** Each stage then fits its own slope, which assumes nothing about how the score's meaning changes over the episode and keeps no history. Its limit is noise: if most stages' `score_slope` sit within one `score_slope_se` of zero, the stages are shorter than the fits can resolve, so lengthen them or improve the score.
+- **Read the per-stage slopes.** They show whether a given change in the score predicts about the same change in outcome at every stage.
     - **Roughly holds:** a chess engine's evaluation in pawns predicts winning about as well throughout the game. Not exactly, since a pawn late in the game is more decisive, with less time to recover.
-    - **Fails:** a score whose meaning shifts over the episode. "Tests passing", when the early tests are trivial and the late ones hard, so one more passing test means much more late. "Distance to goal", when the early moves cross open ground and the last few steps are the hard part. Different measurements at different ticks, such as formatting checks early and test results late. A behaviour that helps early and hurts late, which flips the slope's sign.
-- **Share a key only across ticks whose slopes agree:** one key for every tick if they agree throughout, or one per phase (`opening`, `middlegame`, `endgame`) if they agree only within phases. Sharing is what lets ticks get finer. The rule turns a score into a value by multiplying it by a fitted slope, and a tick's credit is roughly the value after the tick minus the value before. With a slope per tick, those two values use two separately fitted slopes, each with its own error, so a tick where the position barely changed can still get sizeable credit from the difference between those errors, and finer ticks don't make that error smaller. With one slope, a tick's credit is that slope times how much the score changed: no change means no credit, and a slightly wrong slope only makes every tick's credit a bit too big or too small. A slope whose size drifts is tolerable; a slope shared across ticks where the score means opposite things gives half of them credit pointing the wrong way, which is worse than not sharing.
-- **Share without history at first.** All of a group's ticks under one key are fit together, so a shared slope works from the first group. `score_decay = 0` keeps no history, so it can't go stale; raise it only if the shared slope is still noisy. `score_decay` applies to every key in the run; see [Avoiding stale fits](#avoiding-stale-fits).
-- **Finer ticks are then limited by the score itself.** A tick's credit comes from how much the score changed across it. If the score's tick-to-tick changes are mostly measurement noise, finer ticks add little: improve the score before refining the clock.
-- **Rescale `stage_lambda` with the tick.** λ counts stages, not time: credit looks about `1 / (1 − λ)` ticks ahead. When you halve the tick, use √λ to keep the same horizon.
-- **Keep `std_normalize = false`.** Normalizing scales every tick's credit to the same size, including ticks whose real variation is mostly noise.
+    - **Fails:** a score whose meaning shifts over the episode. "Tests passing", when the early tests are trivial and the late ones hard, so one more passing test means much more late. "Distance to goal", when the early moves cross open ground and the last few steps are the hard part. Different measurements at different stages, such as formatting checks early and test results late. A behaviour that helps early and hurts late, which flips the slope's sign.
+- **Share a key only across stages whose slopes agree:** one key for every stage if they agree throughout, or one per phase (`opening`, `middlegame`, `endgame`) if they agree only within phases. Sharing is what lets stages get shorter. The rule turns a score into a value by multiplying it by a fitted slope, and a stage's credit is roughly the value at its end minus the value at its start. With a slope per stage, those two values use two separately fitted slopes, each with its own error, so a stage where the position barely changed can still get sizeable credit from the difference between those errors, and shorter stages don't make that error smaller. With one slope, a stage's credit is that slope times how much the score changed: no change means no credit, and a slightly wrong slope only makes every stage's credit a bit too big or too small. A slope whose size drifts is tolerable; a slope shared across stages where the score means opposite things gives half of them credit pointing the wrong way, which is worse than not sharing.
+- **Share without history at first.** All of a group's stages under one key are fit together, so a shared slope works from the first group. `score_decay = 0` keeps no history, so it can't go stale; raise it only if the shared slope is still noisy. `score_decay` applies to every key in the run; see [Avoiding stale fits](#avoiding-stale-fits).
+- **Shorter stages are then limited by the score itself.** A stage's credit comes from how much the score changed across it. If the score's change over a stage is mostly measurement noise, shorter stages add little: improve the score before shortening them.
+- **Rescale `stage_lambda` with stage length.** λ counts stages, not ticks: credit looks about `1 / (1 − λ)` stages ahead. When you halve stage length, use √λ to keep the same horizon.
+- **Keep `std_normalize = false`.** Normalizing scales every stage's credit to the same size, including stages whose real variation is mostly noise.
 
 #### Configuration
 

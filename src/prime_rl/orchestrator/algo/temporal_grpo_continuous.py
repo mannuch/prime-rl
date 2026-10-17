@@ -123,7 +123,7 @@ mu_k = mean q[., k], p_k = |E_{k+1}| / |E_k|. V_{K+1} = 0.
        stages under one key fit together; across groups, a key's moments
        come from earlier groups, decayed by score_decay per group (0
        keeps none, so a key only ties stages within a group).
-   A key that ties several stages, such as the ticks of an env's clock,
+   A key that ties several stages, such as stages cut by an env's clock,
    takes several points from each rollout, and they share its outcome. Its
    leave-one-out drops all of a rollout's points, and its standard error
    counts rollouts, not points. Sharing a slope changes what the fit's
