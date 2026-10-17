@@ -316,7 +316,7 @@ class TemporalGRPOContinuousAlgoConfig(BaseAlgoConfig):
     """How hard a stage's fitted score slope is pulled toward zero, i.e. toward no shaping. A slope t standard errors from zero keeps t² / (t² + score_shrinkage) of itself; 0 trusts every fit. Acts only on stages whose record entries carry a ``score``."""
 
     score_decay: float = Field(0.9, ge=0.0, lt=1.0)
-    """Per-group decay of the score moments shared under a record's ``pool`` key: a key remembers about 1 / (1 - score_decay) groups. Shorter memory tracks a changing policy; longer memory averages out noise. Acts only on entries that carry a ``pool``. The pooled moments live in orchestrator memory and start empty after a restart."""
+    """Per-group decay of the score moments shared under a record's ``pool`` key: a key remembers about 1 / (1 - score_decay) groups, the current one included; 0 keeps no history, so a key only ties the stages it covers within a group. Shorter memory tracks a changing policy; longer memory averages out noise. Acts only on entries that carry a ``pool``. The pooled moments live in orchestrator memory and start empty after a restart."""
 
 
 class HierarchicalGRPOAlgoConfig(BaseAlgoConfig):
