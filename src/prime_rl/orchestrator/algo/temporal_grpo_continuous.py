@@ -212,7 +212,8 @@ How to write ``reward``, ``value`` and ``score`` from an env — what each
 answers, when to override the reward default, a worked record — is in
 ``docs/algorithms.md`` under "Writing the record"; which handoff signal to
 start with is under "Using a ``score`` instead of a ``value``"; how to design
-and calibrate one is under "Designing a handoff signal".
+and calibrate one is under "Designing a handoff signal"; keeping pooled fits
+and offline values current is under "Avoiding stale fits".
 """
 
 from __future__ import annotations
