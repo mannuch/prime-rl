@@ -459,9 +459,9 @@ reproduce completed (reward 1 by default) and left a state worth 0.6; patch comp
 - each rollout's slope is fit without its own outcome;
 - whatever the slope, shaping only moves credit between a rollout's own stages; it never changes the rollout's total.
 
-A group has 8–16 rollouts, so the fit is noisy. To pool it across groups, give the entry a `pool` key: groups whose entries share a key share one fit, remembered over about `1 / (1 − score_decay)` groups. What a key means is your call, and nothing else is pooled. Use the task's identity in the key (`f"{task_id}/grasp"`) to pool one task with itself across epochs; use one key for a family of tasks only when you're confident the same score predicts the same thing across them. Pooling trades noise for staleness: a pooled fit remembers how an older policy turned handoffs into return (see [Avoiding stale fits](#avoiding-stale-fits)). The pooled state lives in orchestrator memory and starts empty after a restart, so the first `1 / (1 − score_decay)` groups under each key fit from themselves alone.
+A group has 8–16 rollouts, so the fit is noisy. To pool it, give the entry a `pool` key: entries that share a key share one fit, across the stages of a group and across groups, remembered over about `1 / (1 − score_decay)` groups, the current one included (`score_decay = 0` keeps no history). Stages under one key in a group fit from all their completers together; since a rollout's points at those stages share its outcome, the fit leaves out all of them when crediting that rollout, and its standard error counts rollouts, not points. What a key means is your call, and nothing else is pooled. Use the task's identity in the key (`f"{task_id}/grasp"`) to pool one task with itself across epochs; use one key for a family of tasks only when you're confident the same score predicts the same thing across them. Pooling trades noise for staleness: a pooled fit remembers how an older policy turned handoffs into return (see [Avoiding stale fits](#avoiding-stale-fits)). The pooled state lives in orchestrator memory and starts empty after a restart, so the first `1 / (1 − score_decay)` groups under each key fit from themselves alone.
 
-Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled` when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
+Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled`, the key's shared fit including earlier groups, when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
 
 Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`).
 
@@ -541,6 +541,42 @@ A pooled slope and any `value`, whether fit from data or derived from the enviro
 6. **Prefer scores whose link to the outcome comes from the task, not the policy.** Fraction of tests passing predicts eventual success mostly because of what the task is. Diff size predicts it partly because of how the current patch stage behaves, so its slope drifts more as that stage learns. This is a heuristic, not a guarantee.
 
 However stale, a handoff signal only moves credit between a rollout's own stages and never changes its total.
+
+#### Stages from an environment's clock
+
+A task with no natural milestones can still be staged. Most interactive environments advance on a clock of their own: an opponent's move, a simulated user's turn, a simulator step. Make each tick a stage. Every rollout then completes every tick until its episode ends, which is the always-complete case, so the `score` does all the conditioning.
+
+Writing the record:
+
+- **List the same ticks in every trace.** Every trace in a group must report the same stage list, so list every tick up to the longest episode the environment allows, except the last, which is the task stage. Mark a tick at the agent's last sampled node before the environment's update.
+- **Leave the tick an episode ends in unmarked.** A game that ends during tick 30 has failed tick 30: its task reward lands on that tick's tokens and is compared with the group's value of playing on. Marking that tick would leave the task reward no tokens to land on.
+- **Write `reward: 0` on every completed tick**, or a real per-tick reward. The default pays 1 per completed tick, which on a clock pays for lasting longer.
+- **Score every completed tick** from the state the environment just produced: an engine's evaluation of the position after the opponent's reply, a user simulator's estimate of how close the user is to done. Without a score the rule is per-tick GRPO, and the outcome never reaches the earlier ticks.
+- **Set `success_threshold = inf`** when an episode can end early in success. Otherwise a win before the last tick reads as a success with unmarked stages, and the group falls back to plain GRPO credit.
+
+```python
+# Env.run, one tick per opponent reply: marks[k] is the node index of the agent's last
+# turn before tick k's reply, evals[k] the engine's evaluation after it
+interaction.trace.info["stages"] = [
+    {"name": f"move{k + 1}", "node": marks[k], "reward": 0, "score": evals[k]}
+    if k < len(marks)
+    else {"name": f"move{k + 1}", "node": None}
+    for k in range(MAX_MOVES - 1)
+]
+```
+
+Choosing ticks, and when to share a slope:
+
+- **Ticks fall between decisions.** A tick inside a turn splits one decision's tokens between two advantages and asks for a score of a half-written response, so one agent turn is the floor.
+- **Start with fairly coarse ticks and no `pool` key.** Each tick then fits its own slope, which assumes nothing about how the score's meaning changes over the episode and keeps no history. Its limit is noise: if most ticks' `score_slope` sit within one `score_slope_se` of zero, the ticks are finer than the fits can resolve, so coarsen them or improve the score.
+- **Read the per-tick slopes.** They show whether a given change in the score predicts about the same change in outcome at every tick.
+    - **Roughly holds:** a chess engine's evaluation in pawns predicts winning about as well throughout the game. Not exactly, since a pawn late in the game is more decisive, with less time to recover.
+    - **Fails:** a score whose meaning shifts over the episode. "Tests passing", when the early tests are trivial and the late ones hard, so one more passing test means much more late. "Distance to goal", when the early moves cross open ground and the last few steps are the hard part. Different measurements at different ticks, such as formatting checks early and test results late. A behaviour that helps early and hurts late, which flips the slope's sign.
+- **Share a key only across ticks whose slopes agree:** one key for every tick if they agree throughout, or one per phase (`opening`, `middlegame`, `endgame`) if they agree only within phases. Sharing is what lets ticks get finer. The rule turns a score into a value by multiplying it by a fitted slope, and a tick's credit is roughly the value after the tick minus the value before. With a slope per tick, those two values use two separately fitted slopes, each with its own error, so a tick where the position barely changed can still get sizeable credit from the difference between those errors, and finer ticks don't make that error smaller. With one slope, a tick's credit is that slope times how much the score changed: no change means no credit, and a slightly wrong slope only makes every tick's credit a bit too big or too small. A slope whose size drifts is tolerable; a slope shared across ticks where the score means opposite things gives half of them credit pointing the wrong way, which is worse than not sharing.
+- **Share without history at first.** All of a group's ticks under one key are fit together, so a shared slope works from the first group. `score_decay = 0` keeps no history, so it can't go stale; raise it only if the shared slope is still noisy. `score_decay` applies to every key in the run; see [Avoiding stale fits](#avoiding-stale-fits).
+- **Finer ticks are then limited by the score itself.** A tick's credit comes from how much the score changed across it. If the score's tick-to-tick changes are mostly measurement noise, finer ticks add little: improve the score before refining the clock.
+- **Rescale `stage_lambda` with the tick.** λ counts stages, not time: credit looks about `1 / (1 − λ)` ticks ahead. When you halve the tick, use √λ to keep the same horizon.
+- **Keep `std_normalize = false`.** Normalizing scales every tick's credit to the same size, including ticks whose real variation is mostly noise.
 
 #### Configuration
 
