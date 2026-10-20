@@ -465,25 +465,22 @@ Every trace in a group must report the same stage list; a group with a missing o
 
 ### Temporal GRPO with continuous stage rewards
 
-`temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward instead and credits a stage with its TD error against the group's stage values. A stage's value `V_k` is the mean reward-to-go of the rollouts that entered it; stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k*. That is the policy gradient of the rollout's return with the group as critic, applied at every stage node (plain GRPO is the one-stage case): unnormalized, a rollout's stage advantages sum to its return minus the group mean, so this redistributes GRPO's credit to the stages that earned it rather than changing the objective. By default credit stays in reward units (`std_normalize = false`), like prime-rl's GRPO. Setting `std_normalize = true` divides each stage's TD errors by their std over the stage's entrants; with binary stage rewards that makes it exactly the paper's rule (`temporal_grpo` with `std_normalize = true`), in every group, for any task reward that is the same for every rollout failing a given stage.
+`temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward and credits a stage with its TD error against the group's stage values. Stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k* and `V_k` is the mean reward-to-go of the rollouts that entered stage *k*. Unnormalized (`std_normalize = false`, the default), a rollout's stage advantages sum to its return minus the group mean, so the rule redistributes GRPO's credit to the stages that earned it rather than changing the objective. `std_normalize = true` divides each stage's TD errors by their std over the stage's entrants; with binary stage rewards that is exactly the paper's rule. The derivation is in the module docstring of `temporal_grpo_continuous.py`.
 
-The derivation, including why the TD error and what handoff values do to it, is in the module docstring of `temporal_grpo_continuous.py`.
+#### The record
 
-#### Writing the record
+The record is the `trace.info["stages"]` list `temporal_grpo` reads: the task's ordered intermediate stages, each with a `name` and a completion mark (`node` or `token`, `None` if never completed). The task stage is implicit; `trace.reward` is paid in the stage the rollout ended in. Four optional fields shape the credit:
 
-The record is the same `trace.info["stages"]` list `temporal_grpo` reads: the task's ordered intermediate stages, each with a `name` and a completion mark (`node` or `token`, `None` if never completed). The task stage is implicit and is paid `trace.reward`. Two optional scalars on an entry shape the credit.
+| Field | Answers | Allowed on | Default | Effect |
+|---|---|---|---|---|
+| `reward` | What did this stage earn? | Any entered stage, including a failed one (partial credit) | 1 if completed, 0 if not | Adds to the return the policy is trained to collect |
+| `score` | A measurement of the state the stage handed off, on any scale | Completed stages | None | The group fits a slope that turns it into a `value` |
+| `value` | How much is still to be earned from that state, in reward units | Completed stages | None | Pays the stage and charges the next one; never changes a rollout's total |
+| `pool` | Which fits share one slope | Entries with a `score` | None | Shares the fit across the stages of a group, and across groups |
 
-**`reward` answers "what did this stage earn?"** It is the piece of the return the stage is responsible for, in `trace.reward`'s units. The default, 1 if completed and 0 if not, makes completing stages the objective in groups where nobody succeeds, and is the right default for stages that are pass/fail. Override it when:
+An entry carries `score` or `value`, never both, and within a group a stage's completers all carry a `score` or none do. A fitted score can't do much harm: each rollout's slope is fit without its own outcome, a slope within about a standard error of zero shrinks toward no shaping, and shaping never changes a rollout's total. Entries that share a `pool` key share one fit: the stages of a group fit together, and earlier groups' fits are kept for about `1 / (1 − score_decay)` groups. What a key means is your call. Use the task's identity (`f"{task_id}/grasp"`) to pool a task with itself, and one key for a family of tasks only when the score means the same thing across it. Pooled fits live in orchestrator memory and start empty after a restart.
 
-- completion is graded: a 0.7 repro and a 0.3 repro both "complete";
-- a failed stage still earned something: put partial credit on the failed entry;
-- stages are always completed: the default then pays everyone 1 and says nothing.
-
-Stage rewards add to `trace.reward`; the return this rule optimizes is their sum. Don't also fold them into the rubric, or they count twice. `success_threshold` reads `trace.reward` alone. A completed stage with an explicit `reward` of 0 still earns the next stage's group value: completion is structural, the reward is only the scalar.
-
-**`value` answers "from the state this stage handed off, how much is still to be earned?"** It is a forecast, not a grade: for a success-or-nothing task, the probability of eventual success from here times the task reward, plus any stage rewards still ahead. It goes only on completed entries; a `value` on a failed stage makes the record malformed, since a failed stage hands nothing off. The stage is paid its `value` and the next stage is charged it, so it moves credit between neighbours and never changes the total: each stage is judged on how much it improved the outlook it was handed, not on what it inherited. Reward measures the stage, value measures the state after it; a stage that did its work but left a mess has high reward and low value.
-
-Reach for `value` when a stage can complete well or badly in ways the next stage feels (a grasp that holds but is off-centre, a repro that fails on the wrong assertion), or when stages are always completed, so only a quality signal can tell their tokens apart. Without it, the rule prices every handoff out of stage *k* at the same `V_{k+1}` and can't see those differences. A `value` must be computed from the handoff state alone and calibrated to reward units; see [Designing a handoff signal](#designing-a-handoff-signal).
+Stage rewards add to `trace.reward`, so don't also fold them into the rubric. `success_threshold` reads `trace.reward` alone. A completed stage with `reward: 0` still earns the next stage's group value: completion is structural, the reward only the scalar.
 
 A record for reproduce → patch → verify, with `trace.reward = 0`:
 
@@ -497,104 +494,99 @@ interaction.trace.info["stages"] = [
 
 reproduce completed (reward 1 by default) and left a state worth 0.6; patch completed with quality 0.8 and raised the outlook to 0.9; verify failed, earning 0.2, and the task reward 0 lands there. After shaping the stages pay 1.6, 1.1 and −0.7: verify is charged for the 0.9 outlook it squandered. The total, 2.0, is the raw sum, as it always is.
 
-**`score` is a `value` the algorithm calibrates for you.** Most env authors have *measurements* of a handoff (the diff size, how many visible tests pass, the grasp's offset from centre) but not *forecasts* in reward units. Put the measurement in `score`, on any scale and in either direction. Within each group, the algorithm regresses what actually happened after the stage on it, and uses the slope to turn the score into a value. A completed entry carries `value` or `score`, never both, and within a group a stage's completers must all carry a `score` or none of them. Three things keep a bad score from doing harm:
-
-- a slope that's within about a standard error of zero is shrunk toward zero (`score_shrinkage`), which means no shaping, i.e. the rule without a handoff signal;
-- each rollout's slope is fit without its own outcome;
-- whatever the slope, shaping only moves credit between a rollout's own stages; it never changes the rollout's total.
-
-A group has 8–16 rollouts, so the fit is noisy. To pool it across groups, give the entry a `pool` key: groups whose entries share a key share one fit, remembered over about `1 / (1 − score_decay)` groups. What a key means is your call, and nothing else is pooled. Use the task's identity in the key (`f"{task_id}/grasp"`) to pool one task with itself across epochs; use one key for a family of tasks only when you're confident the same score predicts the same thing across them. Pooling trades noise for staleness: a pooled fit remembers how an older policy turned handoffs into return (see [Avoiding stale fits](#avoiding-stale-fits)). The pooled state lives in orchestrator memory and starts empty after a restart, so the first `1 / (1 − score_decay)` groups under each key fit from themselves alone.
-
-Each scored stage logs `stage/<name>/score_slope` and `stage/<name>/score_slope_se` (from the group alone), plus `stage/<name>/score_slope_pooled` when it has a key. A slope within about one standard error of zero means the score isn't telling the rule much; a confidently negative slope means a higher score predicts *worse* outcomes downstream, which usually means the stage is being gamed.
-
 Write the record where you write the completion marks (`Env.run` online or `Task.finalize` offline, as described for `temporal_grpo`).
 
-#### Using a `score` instead of a `value`
+#### Choosing a setup
 
-Start a stage's handoff signal with a `score`, not a `value`. A `value` has to be calibrated: its differences must equal differences in expected return, which an env that sees one rollout at a time rarely knows. A miscalibrated `value` distorts credit, and `std_normalize` won't correct it. A `score` only has to measure; the group calibrates it.
+Start from what ends a stage, and follow the chart. Each node is explained below it.
 
-**The handoff diagnostic.** Watch each stage's mean reward, and the next stage's mean reward among the rollouts that entered it. If the first rises while the second falls, the stage is getting better at its own job in a way that hurts the next one: a handoff effect the record isn't expressing yet, which a `score` or `value` is the place to express.
+```mermaid
+flowchart TD
+    A{"What ends a stage?"} -->|"a milestone the agent achieves"| M1
+    A -->|"a tick of the environment's clock"| C1
 
-Add handoff signals on top of the stage rewards in this order, stopping once the handoff diagnostic stops firing:
+    M1{"Do some rollouts fail it?"} -->|yes| M2["Stage rewards and completion marks"]
+    M1 -->|"no, all complete it"| M0{"Would a stricter check split them?"}
+    M0 -->|yes| M2
+    M0 -->|no| C2
+    M2 --> M3{"Handoff diagnostic fires?"}
+    M3 -->|no| D(["Done"])
+    M3 -->|yes| M4{"Can you write a calibrated value?"}
+    M4 -->|yes| MV["Write a value"]
+    M4 -->|no| MS["Write a score"]
+    MS --> M5{"Slope noisy?"}
+    M5 -->|no| D
+    M5 -->|yes| M6["Better score, larger groups, then a pool key"]
+    M6 --> M7["Write a value calibrated offline from the logged slopes"]
 
-1. No handoff signal: stage rewards and completion marks alone. This is the rule's base case and often enough. Write a `reward` wherever a stage's quality is graded; pass/fail stages can keep the default of 1 or 0.
-2. `score`, fit per group.
-3. If the logged slope is noisy: a more informative score, larger groups, or a `pool` key.
-4. `value`, calibrated offline from the logged slopes, so you stop paying for the per-group noise.
+    C1["Clock record"] --> C2["Score every stage; stages several ticks long; no pool key"]
+    C2 --> C3{"Most slopes within a standard error of zero?"}
+    C3 -->|yes| C4["Lengthen stages or improve the score, then recheck"]
+    C3 -->|no| C5{"Do the per-stage slopes agree?"}
+    C5 -->|throughout| C6["One pool key, score_decay = 0; stages can get shorter"]
+    C5 -->|"within phases"| C7["One pool key per phase"]
+    C5 -->|no| C8["Keep a slope per stage"]
+```
 
-**Start directly with `value`** only when any of these holds. A `value` costs no estimation noise and works from a single completer, so when you can write a calibrated one, it's the better signal:
+**Milestone stages** end when the agent achieves something (reproduce, patch, verify). Rollouts that fail a stage never enter the next one, and comparing only a stage's entrants is what conditions the credit.
 
-- **You can compute the forecast.** The env sees the state well enough to know what's left: a simulator with privileged state and a known success model, or remaining work that's fixed arithmetic (say, the stage rewards still ahead, each with a known pass rate from this state).
-- **You can calibrate offline.** You have logged rollouts from an earlier run, or the logged `score_slope`s from a `score`-based one, and can fit the mapping from your measurement to downstream return once, outside training.
-- **The stage is rarely completed by many rollouts in a group.** A per-group fit needs at least 4 completers of the stage before it produces a slope at all (each rollout's fit leaves itself out and needs 3 points), so a late stage that 2 or 3 rollouts in a group reach gets no shaping from a `score` unless it has a `pool` key with history.
-- **Several measurements matter and you know how they combine.** A fit uses one score. If the handoff depends on, say, both test count and diff size in a known way, combine them into a value yourself rather than collapsing them into one uncalibrated number.
+- **Stage rewards and completion marks** are the base case, and often enough. Write a `reward` where a stage's quality is graded (a 0.7 repro and a 0.3 repro both complete) or where a failed stage still earned partial credit. Pass/fail stages keep the default.
+- **The handoff diagnostic:** a stage's mean reward rises while the next stage's mean reward among its entrants falls. The stage is getting better at its own job in a way that hurts the next one, and the record has no way to say so yet. A `score` or `value` is the place to say it.
+- **A calibrated value** is one whose differences equal differences in expected return, which an env that sees one rollout at a time rarely knows. Write one directly only when you can compute the forecast (a simulator with privileged state and a known success model), when you can calibrate a measurement offline, when the stage has fewer than 4 completers in a typical group (a per-group fit needs 4 before it gives a slope), or when several measurements combine in a way you know. Otherwise write a `score`: it only has to measure, and the group calibrates it.
+- **A noisy slope** is one within about one standard error of zero (`stage/<name>/score_slope` and `score_slope_se`). Fix it in this order: a more informative score, larger groups, then a `pool` key, which trades noise for staleness (see [Avoiding stale fits](#avoiding-stale-fits)). Last, write a `value` calibrated offline from the logged slopes, which stops paying for the per-group noise.
+- **A stricter check** helps milestones every rollout completes, which say nothing on their own. A loose check ("gripper closed") can often be tightened ("holds through a shake"), which brings back the gating with no calibration at all. If no stricter check would split the rollouts, treat the stages like clock stages: the score has to do the conditioning.
 
-**When every stage always completes**, the default is still a `score`, but checked sooner. A `score` is easiest to fit here: every rollout completes every stage, so each stage's fit uses the whole group and the few-completers reason to start with a `value` never applies. It also matters more. With no failures there is no progression signal to fall back on, so a `score` that shrinks to zero leaves per-stage GRPO, and with default stage rewards only the final segment trains. Three adjustments:
+**Clock stages** end at a tick of the environment's own clock: an opponent's move, a simulated user's turn, a simulator step. A stage can span one tick or several. Every rollout completes every stage until its episode ends, so without a score the rule is per-stage GRPO and the outcome never reaches the earlier stages.
 
-1. **Check whether a stricter completion check would split the rollouts.** A stage that always completes may have too loose a predicate. Tightening it ("holds through a shake", not "gripper closed") turns quality into the gate and restores discrete conditioning with no calibration at all; a `score` can still sit on top.
-2. **Score the handoff state, not the stage's work.** With every rollout a completer, a `score` that is a linear function of the stage's `reward` merges into the quality term, and `std_normalize` cancels it; the same holds for a `value`. Measure where things ended up, not how well the stage scored.
-3. **Look at the logged slope early**, and move to a `pool` key, larger groups or an offline-calibrated `value` sooner than you would when stages can fail.
+- **The clock record:**
+    - List the same stages in every trace: every stage the longest episode the environment allows would reach, except the last, which is the task stage. Mark each at the agent's last sampled node before the tick that ends it.
+    - Leave the stage an episode ends in unmarked. Its task reward then lands on that stage's tokens and is compared with the group's value of playing on; marking it would leave the reward no tokens to land on.
+    - Write `reward: 0` on every completed stage, or a real per-stage reward. The default pays 1 per completed stage, which on a clock pays for lasting longer.
+    - Set `success_threshold = inf` when an episode can end early in success. Otherwise an early win reads as a success with unmarked stages, and the group falls back to plain GRPO credit.
+- **Start with stages several ticks long and no `pool` key.** Each stage then fits its own slope, which assumes nothing about how the score's meaning changes over the episode. End stages between decisions: one agent turn is the shortest sensible stage.
+- **If most slopes sit within a standard error of zero,** the stages are shorter than the fits can resolve: lengthen them or improve the score.
+- **Read the per-stage slopes.** They show whether a given change in the score predicts about the same change in outcome at every stage. A chess engine's evaluation roughly does. "Tests passing" doesn't when the late tests are the hard ones, nor does a score that measures different things at different stages, or a behaviour that helps early and hurts late, which flips the slope's sign.
+- **Share a key only across stages whose slopes agree.** With a slope per stage, a stage's credit is the difference between two separately fitted values, so a stage where the position barely changed can still pick up credit from the two fits' errors. With one slope, its credit is that slope times the change in score, so shorter stages stay clean. Sharing across stages where the score means opposite things gives half of them credit pointing the wrong way, which is worse than not sharing. A shared slope works from the first group, since a group's stages under one key fit together, so start with `score_decay = 0`, which keeps no history.
+- **Shorter stages are limited by the score itself.** If the score's change over a stage is mostly measurement noise, shortening adds little.
+
+```python
+# Env.run, one stage per opponent reply: marks[k] is the node index of the agent's last
+# turn before reply k, evals[k] the engine's evaluation after it
+interaction.trace.info["stages"] = [
+    {"name": f"move{k + 1}", "node": marks[k], "reward": 0, "score": evals[k]}
+    if k < len(marks)
+    else {"name": f"move{k + 1}", "node": None}
+    for k in range(MAX_MOVES - 1)
+]
+```
 
 #### Designing a handoff signal
 
-A stage's `reward` and its handoff signal (`score` or `value`) are both numbers on the stage's entry, but they do different jobs:
+To decide whether a quantity is a `reward` or a handoff signal, ask whether you'd pay for it even if it changed nothing downstream. A clean patch or a fast solve: yes, so it's a `reward`. Visible tests passing after a patch, or a grasp's offset from centre: you care only because they predict what comes next, so it's a `score` or `value`. A quantity that is both is usually two numbers: reward the stage's work, and score the state it left. Don't reuse the `reward` as the `score`, which pays the stage twice at the next stage's expense.
 
-| | `reward` | `score` / `value` |
-|---|---|---|
-| Answers | What did this stage earn? | How much is still to be earned from the state it handed off? |
-| Effect on the return | Adds to it; the policy is trained to collect it | None; moves credit from the next stage to this one, and the rollout's total is unchanged |
-| On a failed stage | Allowed, as partial credit | Not allowed; a failed stage hands nothing off |
-| If it's wrong | The policy optimizes the wrong thing | Credit for the right objective lands on the wrong stage |
-
-To decide where a quantity goes, ask whether you'd pay for it even if it changed nothing downstream. A clean patch, a fast solve or a well-formed answer: yes, so it's a `reward`. Visible tests passing after a patch or a grasp's offset from centre: you care only because they predict what comes next, so they're a handoff signal. Some quantities are both, and then they're usually two numbers: reward the stage's work, and score the state it left. Don't reuse the `reward` as the `score`. That pays the stage a second time for its own work, at the next stage's expense.
-
-For both `score` and `value`:
-
-- **Measure the handoff state at the boundary.** Compute the signal from what the next stage inherits, at the moment the stage completes. A signal that peeks at what happened afterwards leaks the outcome into earlier stages, which is `stage_lambda = 1` with extra steps.
-- **Make it vary where it matters.** The signal acts only through differences between a stage's completers in a group. If it's the same for all of them it does nothing, and a constant offset changes nothing.
-- **Prefer measurements that are hard to move without doing the work.** The stage is paid for raising the signal, so a policy can learn to inflate it without improving the state, taking credit from the next stage. Tests passing is harder to inflate than lines changed. A fitted `score` catches gaming: its `score_slope` falls or turns negative, and the shaping shrinks with it. A `value` keeps paying for it.
-
-For a `score`:
-
-- **Use one number, roughly linear in what's left.** The fit is a straight line from score to downstream return. Fractions beat counts when tasks differ in size. Take the log of a quantity that spans orders of magnitude, such as diff size. Clip outliers, since one extreme score dominates a least-squares fit. A 0/1 indicator is fine: its slope is the difference in mean downstream return between the two sides.
-- **Scale and direction are free, meaning isn't.** Any units, and higher can be better or worse; the fit sorts that out. Under one `pool` key, though, the score must mean the same thing in every group. If you change how it's computed, change the key.
-
-For a `value`:
-
-- **Forecast the whole remaining return.** That is the task reward plus every later stage's `reward`, including the default 1 for each later stage the rollout will complete. With default stage rewards, a probability of eventual success alone misses those.
-- **Get the differences right, not the level.** Only differences between completers matter, so a value off by a constant is fine. One whose spread is off by a factor is not: half the true spread leaves half the carry-forward unaccounted for, double over-corrects, and `std_normalize` repairs neither. A heuristic that only ranks handoffs needs a mapping to reward units before it's a value; until then, write it as a `score`.
-- **Check the calibration by writing it as a `score`.** The logged `score_slope`, averaged over groups, should sit near 1. Below 1, your values are spread too wide; above 1, too narrow.
-- **Recalibrate as the policy changes.** A value forecasts what the current policy will earn from a state, and as later stages improve, the same handoff becomes worth more. A `value` calibrated once goes stale; a `score` is refit every group. See [Avoiding stale fits](#avoiding-stale-fits).
+- **Measure the handoff state at the boundary,** from what the next stage inherits. A signal that peeks at what happened afterwards leaks the outcome into earlier stages.
+- **Make it vary among a stage's completers.** Only differences between them matter; a constant offset does nothing.
+- **Prefer measurements that are hard to inflate without doing the work.** Tests passing is harder to game than lines changed. A gamed `score` shows up as a falling or negative `score_slope`, and its shaping shrinks; a `value` keeps paying.
+- **For a `score`:** one number, roughly linear in the return still to come. Fractions beat counts when tasks differ in size; take the log of quantities that span orders of magnitude; clip outliers. A 0/1 indicator is fine. Scale and direction are free, but under one `pool` key the score must mean the same thing everywhere.
+- **For a `value`:** forecast the whole remaining return, including the default 1 for each later stage the rollout will complete. Only differences matter, so a constant offset is fine but a wrong spread is not, and `std_normalize` won't repair it. To check calibration, write it as a `score` for a while: the logged slope should average near 1 (below 1, the values are spread too wide).
 
 #### Avoiding stale fits
 
-A pooled slope and any `value`, whether fit from data or derived from the environment, forecast how the policy playing the later stages turns a handoff into return. That changes with every optimizer step, not only between checkpoints. If the patch stage gets better at recovering from a sloppy repro, the repro's score predicts less and the true slope falls. Only differences between completers matter, so drift in the level is harmless: if better downstream play adds the same amount to every handoff, the signal stays calibrated. Staleness bites when learning treats good and bad handoffs differently, as in the repro example. It is a matter of degree: a forecast is roughly right for policies near the one it describes, and drifts as the downstream stages learn. Ways to keep it in check:
+A pooled slope and any `value` forecast how the policy playing the later stages turns a handoff into return, and that changes with every optimizer step. Drift that shifts every handoff equally is harmless; drift that treats good and bad handoffs differently is not.
 
-1. **Start without a `pool` key.** A per-group fit only sees the current policy (give or take the async off-policy lag), so it can't go stale. If it's too noisy, first try the fixes that add no staleness: a more informative score, or larger groups. Pooling is the fix that trades noise for staleness, so reach for it last.
-2. **If you pool, budget the memory in optimizer steps, not groups.** A key remembers about `1 / (1 − score_decay)` groups *under that key*, so its age in steps depends on how often the key appears:
-    - **A key shared by a family of tasks** may appear several times per step. The default 0.9 (about 10 groups) then spans a step or two, which is fine.
-    - **A per-task key** appears about once per epoch. The same 10 groups then reach back about 10 epochs. Either lower `score_decay` a lot, which leaves little to pool, or use a broader key if the score means the same thing across those tasks.
-3. **Watch the gap between the two logged slopes.** `score_slope` is the current group alone, and `score_slope_pooled` includes history. Per-group slopes are noisy, but their trend over steps is current. If the pooled slope consistently lags that trend, the pool is stale: shorten the memory or drop the key.
-4. **Don't count on shrinkage to catch it.** Shrinkage discounts a slope that is uncertain, and pooling makes the slope look certain because it has many points. A stale pooled fit is confidently wrong, and shrinkage passes it through. Staleness is the one failure the guards don't catch; watching the slope gap is the defence.
-5. **Recheck any `value` on a schedule.** Every so often, write it as a `score` for a while: a logged slope that moves away from 1 over training is staleness showing up. How fast a `value` drifts depends on where it came from:
-    - **Fit to data from an earlier policy** (offline calibration): right at the start of the run, then drifts as the later stages change. Refit it from recent rollouts every so often, not only at the start of a run.
-    - **Derived from the environment** (privileged simulator state, a physics or success model): it has an assumption about later play built in, and is off by however much the real policy differs from it. A formula that assumes competent play ("is the task still solvable from here", distance to goal for a good planner) is too optimistic early and becomes more accurate as the policy improves; one that assumes, say, a fixed pass rate per stage can drift either way.
-    - **Truly policy-independent**: the remaining return from the handoff is already locked in or set by the environment, whatever the policy does later. Only this never goes stale, and it is rare, since later stages the policy can't influence aren't worth training.
-
-    Better still, keep the measurement as a `score` and let each group refit it. If you must use a fixed `value`, run with `stage_lambda = 1` and `std_normalize = false`, where a miscalibrated value costs variance but not bias.
-6. **Prefer scores whose link to the outcome comes from the task, not the policy.** Fraction of tests passing predicts eventual success mostly because of what the task is. Diff size predicts it partly because of how the current patch stage behaves, so its slope drifts more as that stage learns. This is a heuristic, not a guarantee.
+- **A fit from the current group alone can't go stale,** which is why the chart reaches for a `pool` key late.
+- **Budget a pool's memory in optimizer steps.** A key remembers about `1 / (1 − score_decay)` groups under that key, the current one included. A key shared by a family of tasks may span a step or two; a per-task key, seen about once per epoch, can reach back many epochs.
+- **Watch `score_slope_pooled` against the trend of `score_slope`.** A pooled slope that consistently lags the per-group slopes is stale: shorten the memory or drop the key. Shrinkage won't catch this, since pooling makes a stale slope look certain.
+- **Recheck a `value` by writing it as a `score` for a while.** A slope drifting away from 1 is staleness. A value fit to an earlier policy's data drifts; one that assumes competent play converges as the policy improves; only a value no later play can change never goes stale. A fixed `value` is safest with `stage_lambda = 1` and `std_normalize = false`, where miscalibration costs variance, not bias.
 
 However stale, a handoff signal only moves credit between a rollout's own stages and never changes its total.
 
 #### Configuration
 
-`stage_lambda` is λ over stages: 0 credits each stage against the group's value of the stage it leads to, which keeps downstream variance out of early stages; 1 credits each stage with the rollout's full remaining return minus `V_k`, which blames a stage for everything after it. Raise it when the quality of a stage's work carries into later stages in ways neither "entered stage k+1" nor a `value` captures.
-
-With a `value` or `score` in place, λ also decides what that signal does: each handoff a stage is paid is scaled by (1 − λ), while the charge to the next stage keeps full weight. In practice:
-
-- **Start at λ = 0.** The signal then carries the downstream credit itself, so its calibration matters. Raise λ only if the handoff diagnostic (a stage improving while the next one gets worse) still fires with the signal in place.
-- **If you have a measurement but no calibration, write a `score`, not a rough `value`.** The group fits the scale for you, whatever `std_normalize` is set to.
-- **High λ makes a rough `value` safe only with `std_normalize = false`, the default.** There, a `value` at λ = 1 acts purely as a baseline for the next stage, where a wrong scale costs variance but never bias. With `std_normalize = true`, each handoff is paid at one stage's scale and charged at the next's, so it keeps carrying credit at every λ and a miscalibrated `value` still distorts it.
+- **`stage_lambda`** (default 0) is λ over stages. At 0, each stage is credited against the group's value of the stage it leads to, which keeps downstream variance out of early stages; at 1, each stage gets the rollout's full remaining return minus `V_k`. Raise it only if the handoff diagnostic still fires with a handoff signal in place. With a signal, each handoff a stage is paid is scaled by (1 − λ) while the charge to the next stage keeps full weight. λ counts stages, so when you halve stage length, use √λ to keep the same horizon.
+- **`std_normalize`** (default false) keeps credit in reward units, so totals are conserved and λ behaves as described. Turn it on to reproduce the paper's rule; keep it off for clock stages, where it would scale stages that are mostly noise up to full size.
+- **`score_shrinkage`** (default 1) pulls a slope t standard errors from zero to t² / (t² + `score_shrinkage`) of itself, toward no shaping.
+- **`score_decay`** (default 0.9) sets a `pool` key's memory, about `1 / (1 − score_decay)` groups; 0 keeps no history, so a key only ties the stages it covers within a group.
 
 ```toml
 [orchestrator.train.algo]
@@ -602,7 +594,7 @@ type = "temporal_grpo_continuous"
 std_normalize = false   # true reproduces the paper's rule for binary stages
 stage_lambda = 0.0      # 1 credits each stage with the rollout's remaining return
 score_shrinkage = 1.0   # only for stages whose entries carry a score
-score_decay = 0.9       # only for entries that carry a pool key
+score_decay = 0.9       # only for entries that carry a pool key; 0 keeps no history
 ```
 
 ### Self-Play Advantage (RAE)

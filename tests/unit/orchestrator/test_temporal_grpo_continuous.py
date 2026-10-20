@@ -3,6 +3,7 @@
 import itertools
 import math
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -209,7 +210,7 @@ def scored(scores, rewards, pool=None):
 def test_linear_score_recovers_slope_and_conserves_credit():
     # Downstream return is exactly 2 * score + 1, so every leave-one-out slope is 2 with no error.
     records = scored([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
-    filled, moments = fit_handoff_values(records, 1, {})
+    filled, moments, _ = fit_handoff_values(records, 1, {1: None}, {})
     assert [v for r in filled for v in r.stage_values] == pytest.approx([-3.0, -1.0, 1.0, 3.0])
     assert moments[1].slope() == (pytest.approx(2.0), pytest.approx(0.0, abs=1e-6))
     # The potentials telescope: totals are still the raw return minus the group mean (5).
@@ -221,8 +222,8 @@ def test_linear_score_recovers_slope_and_conserves_credit():
 def test_fit_leaves_own_return_out():
     records = scored([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
     changed = scored([0.0, 1.0, 2.0, 3.0], [9.0, 3.0, 5.0, 7.0])
-    before, _ = fit_handoff_values(records, 1, {})
-    after, _ = fit_handoff_values(changed, 1, {})
+    before, _, _ = fit_handoff_values(records, 1, {1: None}, {})
+    after, _, _ = fit_handoff_values(changed, 1, {1: None}, {})
     # Rollout 0's outcome moves the slope that credits the others, never its own.
     assert after[0].stage_values == before[0].stage_values
     assert after[1].stage_values != before[1].stage_values
@@ -230,7 +231,7 @@ def test_fit_leaves_own_return_out():
 
 def test_uninformative_score_is_unshaped():
     unscored = [StageRecord([5], 10, reward) for reward in (1.0, 0.0, 1.0, 0.0)]
-    constant, _ = fit_handoff_values(scored([2.0] * 4, [1.0, 0.0, 1.0, 0.0]), 1, {})
+    constant, _, _ = fit_handoff_values(scored([2.0] * 4, [1.0, 0.0, 1.0, 0.0]), 1, {1: None}, {})
     assert stage_advantages(constant, 1) == stage_advantages(unscored, 1)
 
 
@@ -251,11 +252,37 @@ def test_shrinkage_pulls_noisy_slopes_to_zero():
 def test_prior_moments_fit_a_group_too_small_to_fit_alone():
     # Three completers leave two points for each leave-one-out fit, which is no slope.
     records = scored([0.0, 1.0, 2.0], [0.0, 2.0, 4.0])
-    alone, _ = fit_handoff_values(records, 1, {})
+    alone, _, _ = fit_handoff_values(records, 1, {1: None}, {})
     assert [v for r in alone for v in r.stage_values] == pytest.approx([0.0, 0.0, 0.0])
     prior = Moments.of([(0.0, 0.0), (1.0, 2.0), (2.0, 4.0), (3.0, 6.0)])
-    pooled, _ = fit_handoff_values(records, 1, {1: prior})
+    pooled, _, _ = fit_handoff_values(records, 1, {1: "p"}, {"p": prior})
     assert [v for r in pooled for v in r.stage_values] == pytest.approx([-2.0, 0.0, 2.0])
+
+
+def test_tied_stages_leave_a_rollouts_points_out_at_every_stage():
+    # Two scored stages share a key; each rollout's return after both is its task reward.
+    def tied(rewards):
+        return [
+            StageRecord([5, 10], 15, reward, stage_rewards=[0.0, 0.0], stage_scores=[x, x + 1], stage_pools=["p", "p"])
+            for x, reward in zip([0.0, 1.0, 2.0, 3.0, 4.0], rewards, strict=True)
+        ]
+
+    before, _, keyed = fit_handoff_values(tied([0.0, 2.0, 4.0, 6.0, 8.0]), 2, {1: "p", 2: "p"}, {})
+    assert [v for r in before for v in r.stage_values] == pytest.approx([-4, -4, -2, -2, 0, 0, 2, 2, 4, 4])
+    assert keyed["p"].slope()[0] == pytest.approx(2.0)
+    after, _, _ = fit_handoff_values(tied([0.0, 2.0, 4.0, 6.0, 20.0]), 2, {1: "p", 2: "p"}, {})
+    # Rollout 4's outcome moves the slope that credits the others, never its own, at either stage.
+    assert after[4].stage_values == before[4].stage_values
+    assert after[0].stage_values != before[0].stage_values
+
+
+def test_tied_stages_count_rollouts_not_points():
+    points = [(0.0, 1.0), (1.0, 3.0), (2.0, 4.0), (3.0, 7.0)]
+    twice = Moments.over([dict(enumerate(points)), dict(enumerate(points))])
+    # The same rollouts seen at two stages carry no more information than at one.
+    assert twice.slope() == (pytest.approx(1.9), pytest.approx(Moments.of(points).slope()[1]))
+    # Counting points would treat them as twice the evidence.
+    assert replace(twice, tied=False).slope()[1] < twice.slope()[1]
 
 
 def test_pooled_slope_ignores_group_levels():
