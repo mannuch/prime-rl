@@ -222,13 +222,11 @@ for lower noise, and ``score_decay`` sets the trade: a key remembers about
 1 / (1 - score_decay) groups, the current one included, and 0 keeps no
 history.
 
-How to write ``reward``, ``value`` and ``score`` from an env — what each
-answers, when to override the reward default, a worked record — is in
-``docs/algorithms.md`` under "Writing the record"; which handoff signal to
-start with is under "Using a ``score`` instead of a ``value``"; how to design
-and calibrate one is under "Designing a handoff signal"; keeping pooled fits
-and offline values current is under "Avoiding stale fits"; staging a task by
-its environment's clock is under "Stages from an environment's clock".
+How to write ``reward``, ``value``, ``score`` and ``pool`` from an env is in
+``docs/algorithms.md``: the fields and a worked record under "The record"; a
+decision chart from milestone or clock stages to the signals to write under
+"Choosing a setup"; designing a handoff signal and keeping it current under
+"Designing a handoff signal" and "Avoiding stale fits".
 """
 
 from __future__ import annotations
