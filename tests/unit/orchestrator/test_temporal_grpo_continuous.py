@@ -5,15 +5,16 @@ import math
 import random
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
 from prime_rl.orchestrator.algo import temporal_grpo as binary
 from prime_rl.orchestrator.algo.temporal_grpo import StageRecord
 from prime_rl.orchestrator.algo.temporal_grpo_continuous import (
+    Fit,
     Moments,
     fit_handoff_values,
     score_pools,
-    shrunk,
     stage_advantages,
 )
 
@@ -212,7 +213,8 @@ def test_linear_score_recovers_slope_and_conserves_credit():
     records = scored([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
     filled, moments, _ = fit_handoff_values(records, 1, {1: None}, {})
     assert [v for r in filled for v in r.stage_values] == pytest.approx([-3.0, -1.0, 1.0, 3.0])
-    assert moments[1].slope() == (pytest.approx(2.0), pytest.approx(0.0, abs=1e-6))
+    fit = moments[1].fit()
+    assert (fit.weights, fit.se) == (pytest.approx([2.0]), pytest.approx([0.0], abs=1e-6))
     # The potentials telescope: totals are still the raw return minus the group mean (5).
     adv = stage_advantages(filled, 1, std_normalize=False)
     for record, tokens in zip(filled, adv, strict=True):
@@ -237,16 +239,21 @@ def test_uninformative_score_is_unshaped():
 
 def test_slope_and_standard_error_match_the_textbook():
     # b = Sxy / Sxx = 9.5 / 5, RSS = Syy - b * Sxy = 0.7, SE = sqrt(RSS / (n - 2) / Sxx).
-    slope, se = Moments.of([(0.0, 1.0), (1.0, 3.0), (2.0, 4.0), (3.0, 7.0)]).slope()
-    assert (slope, se) == (pytest.approx(1.9), pytest.approx(math.sqrt(0.7 / 2 / 5)))
+    fit = Moments.of([(0.0, 1.0), (1.0, 3.0), (2.0, 4.0), (3.0, 7.0)]).fit()
+    assert (fit.weights, fit.se) == (pytest.approx([1.9]), pytest.approx([math.sqrt(0.7 / 2 / 5)]))
+    assert fit.wald == pytest.approx((1.9 / math.sqrt(0.7 / 2 / 5)) ** 2)  # the squared t of one feature
 
 
 def test_shrinkage_pulls_noisy_slopes_to_zero():
-    assert shrunk(2.0, 0.0, 1.0) == 2.0  # an exact fit is kept whole
-    assert shrunk(1.0, 1.0, 1.0) == pytest.approx(0.5)  # one standard error from zero keeps half
-    assert shrunk(1.0, 1.0, 0.0) == 1.0  # no shrinkage trusts the fit
-    assert shrunk(*Moments().slope(), 1.0) == 0.0  # an undetermined fit is no shaping
-    assert shrunk(1.5, math.inf, 0.0) == 0.0  # and stays so without shrinkage (no 0 * inf)
+    def fit(weights, wald):
+        return Fit(np.array(weights), np.ones(len(weights)), wald, len(weights))
+
+    assert fit([2.0], math.inf).shrunk(1.0) == pytest.approx([2.0])  # an exact fit is kept whole
+    assert fit([1.0], 1.0).shrunk(1.0) == pytest.approx([0.5])  # one standard error from zero keeps half
+    assert fit([1.0], 1.0).shrunk(0.0) == pytest.approx([1.0])  # no shrinkage trusts the fit
+    # With p features, noise puts the weights about sqrt(p) standard errors from zero, so W = p keeps half too.
+    assert fit([1.0, -2.0], 2.0).shrunk(1.0) == pytest.approx([0.5, -1.0])
+    assert Moments.empty(1).fit() is None  # an undetermined fit is no shaping
 
 
 def test_prior_moments_fit_a_group_too_small_to_fit_alone():
@@ -269,7 +276,7 @@ def test_tied_stages_leave_a_rollouts_points_out_at_every_stage():
 
     before, _, keyed = fit_handoff_values(tied([0.0, 2.0, 4.0, 6.0, 8.0]), 2, {1: "p", 2: "p"}, {})
     assert [v for r in before for v in r.stage_values] == pytest.approx([-4, -4, -2, -2, 0, 0, 2, 2, 4, 4])
-    assert keyed["p"].slope()[0] == pytest.approx(2.0)
+    assert keyed["p"].fit().weights == pytest.approx([2.0])
     after, _, _ = fit_handoff_values(tied([0.0, 2.0, 4.0, 6.0, 20.0]), 2, {1: "p", 2: "p"}, {})
     # Rollout 4's outcome moves the slope that credits the others, never its own, at either stage.
     assert after[4].stage_values == before[4].stage_values
@@ -280,24 +287,61 @@ def test_tied_stages_count_rollouts_not_points():
     points = [(0.0, 1.0), (1.0, 3.0), (2.0, 4.0), (3.0, 7.0)]
     twice = Moments.over([dict(enumerate(points)), dict(enumerate(points))])
     # The same rollouts seen at two stages carry no more information than at one.
-    assert twice.slope() == (pytest.approx(1.9), pytest.approx(Moments.of(points).slope()[1]))
+    assert (twice.fit().weights, twice.fit().se) == (pytest.approx([1.9]), pytest.approx(Moments.of(points).fit().se))
     # Counting points would treat them as twice the evidence.
-    assert replace(twice, tied=False).slope()[1] < twice.slope()[1]
+    assert replace(twice, tied=False).fit().se < twice.fit().se
 
 
 def test_pooled_slope_ignores_group_levels():
     # Two groups with the same within-group slope at different score levels.
     low = [(0.0, 0.0), (1.0, 2.0), (2.0, 4.0)]
     high = [(10.0, 0.0), (11.0, 2.0), (12.0, 4.0)]
-    assert (Moments.of(low) + Moments.of(high)).slope()[0] == pytest.approx(2.0)
+    assert (Moments.of(low) + Moments.of(high)).fit().weights == pytest.approx([2.0])
     # Pooling the raw points would mistake the level difference for a slope.
-    assert Moments.of(low + high).slope()[0] < 0.5
+    assert Moments.of(low + high).fit().weights[0] < 0.5
 
 
 def test_score_pools_require_agreement_within_a_stage():
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0], pool="p"), 1) == {1: "p"}
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1) is None
     assert score_pools(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1) is None
+    # Completers must report the same features, and stages sharing a key the same ones.
+    assert score_pools(scored([{"a": 0.0}], [1.0]) + scored([{"b": 1.0}], [0.0]), 1) is None
+
+    def two_stages(first, second):
+        return [StageRecord([5, 10], 15, 0.0, stage_scores=[first, second], stage_pools=["p", "p"])]
+
+    assert score_pools(two_stages({"a": 0.0}, {"a": 1.0}), 2) == {1: "p", 2: "p"}
+    assert score_pools(two_stages({"a": 0.0}, {"a": 1.0, "b": 2.0}), 2) is None
+
+
+def test_score_features_fit_jointly():
+    # Downstream return is exactly 2 * a - b + 1, with a and b uncorrelated: every
+    # leave-one-out fit recovers both weights, and each value is the prediction's deviation.
+    a, b = [0.0, 1.0, 0.0, 1.0, 2.0, 2.0], [0.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+    records = scored([{"a": x, "b": y} for x, y in zip(a, b)], [2 * x - y + 1 for x, y in zip(a, b)])
+    filled, moments, _ = fit_handoff_values(records, 1, {1: None}, {})
+    assert moments[1].fit().weights == pytest.approx([2.0, -1.0])
+    predicted = [2 * x - y for x, y in zip(a, b)]
+    mean = sum(predicted) / len(predicted)
+    assert [r.stage_values[0] for r in filled] == pytest.approx([v - mean for v in predicted])
+
+
+def test_one_named_feature_is_the_scalar_score():
+    scores, rewards = [0.0, 1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 6.0, 5.0, 9.0]
+    plain, _, _ = fit_handoff_values(scored(scores, rewards), 1, {1: None}, {})
+    named, _, _ = fit_handoff_values(scored([{"x": s} for s in scores], rewards), 1, {1: None}, {})
+    assert [r.stage_values for r in named] == [r.stage_values for r in plain]
+
+
+def test_a_constant_feature_drops_out_of_the_fit():
+    # "c" never varies among the completers, so the fit is "x" alone, with one feature's
+    # degrees of freedom and shrinkage.
+    scores, rewards = [0.0, 1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 6.0, 5.0, 9.0]
+    alone, _, _ = fit_handoff_values(scored(scores, rewards), 1, {1: None}, {})
+    padded, moments, _ = fit_handoff_values(scored([{"x": s, "c": 7.0} for s in scores], rewards), 1, {1: None}, {})
+    assert [r.stage_values[0] for r in padded] == pytest.approx([r.stage_values[0] for r in alone])
+    assert moments[1].fit().rank == 1
 
 
 def test_stage_lambda_one_is_return_to_go():

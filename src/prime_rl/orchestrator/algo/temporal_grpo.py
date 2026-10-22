@@ -22,9 +22,10 @@ ignored. The final stage is implicit: the task reward itself, over the tokens
 after the last intermediate stage — so the task objective is preserved exactly.
 An entry may also carry ``reward``, the scalar earned in that stage, and a
 completed entry either a ``value``, the env's estimate of the return still
-expected from the state it handed off, or a ``score`` of that state (with an
-optional ``pool`` key) for the algorithm to calibrate; this binary rule ignores
-them all (``temporal_grpo_continuous`` is the rule that uses them).
+expected from the state it handed off, or a ``score`` of that state (a number,
+or a dict of named numbers, with an optional ``pool`` key) for the algorithm to
+calibrate; this binary rule ignores them all (``temporal_grpo_continuous`` is
+the rule that uses them).
 """
 
 from __future__ import annotations
@@ -44,6 +45,9 @@ if TYPE_CHECKING:
     from prime_rl.orchestrator.clients import InferenceClient
 
 
+Score = float | dict[str, float]  # one handoff measurement, or several named ones
+
+
 @dataclass
 class StageRecord:
     """One rollout reduced to what the credit rules need."""
@@ -53,7 +57,7 @@ class StageRecord:
     reward: float  # the task reward
     stage_rewards: list[float] | None = None  # per entered intermediate stage; None = 1.0 if completed else 0.0
     stage_values: list[float] | None = None  # per completed intermediate stage: value of the state it handed off
-    stage_scores: list[float | None] | None = None  # per completed intermediate stage: uncalibrated handoff score
+    stage_scores: list[Score | None] | None = None  # per completed intermediate stage: uncalibrated handoff score
     stage_pools: list[str | None] | None = None  # per completed intermediate stage: key sharing the score's fit
 
     def stage_reward(self, k: int) -> float:
@@ -67,10 +71,12 @@ class StageRecord:
             return 0.0
         return self.stage_values[k - 1]
 
-    def stage_score(self, k: int) -> float | None:
+    def stage_score(self, k: int) -> dict[str, float] | None:
+        """Stage k's score as named features; a single number is the one feature named ""."""
         if self.stage_scores is None or not 1 <= k <= len(self.boundaries):
             return None
-        return self.stage_scores[k - 1]
+        score = self.stage_scores[k - 1]
+        return score if isinstance(score, dict) else {"": float(score)}
 
     def stage_pool(self, k: int) -> str | None:
         if self.stage_pools is None or not 1 <= k <= len(self.boundaries):
@@ -83,7 +89,7 @@ class ParsedStages(NamedTuple):
     boundaries: list[int]  # per completed intermediate stage
     rewards: list[float]  # per entered intermediate stage
     values: list[float]  # per completed intermediate stage
-    scores: list[float | None]  # per completed intermediate stage
+    scores: list[Score | None]  # per completed intermediate stage
     pools: list[str | None]  # per completed intermediate stage
 
 
@@ -98,6 +104,15 @@ def _finite(x: Any) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(x)
 
 
+def _parse_score(score: Any) -> Score | None:
+    """A number, or a non-empty dict of finite numbers under non-empty names; None if malformed."""
+    if isinstance(score, dict):
+        if not score or not all(isinstance(name, str) and name and _finite(x) for name, x in score.items()):
+            return None
+        return {name: float(x) for name, x in score.items()}
+    return float(score) if _finite(score) else None
+
+
 def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> ParsedStages | None:
     """The record's stages, with the reward of each entered intermediate stage
     and the handoff fields of each completed one, or None if malformed."""
@@ -108,7 +123,7 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
     boundaries: list[int] = []
     rewards: list[float] = []
     values: list[float] = []
-    scores: list[float | None] = []
+    scores: list[Score | None] = []
     pools: list[str | None] = []
     for entry in raw:
         node, token = entry.get("node"), entry.get("token")
@@ -130,10 +145,14 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
             return None
         if value is None:
             value = 0.0
-        if not _finite(value) or (score is not None and not _finite(score)):
+        if not _finite(value):
             return None
+        if score is not None:
+            score = _parse_score(score)
+            if score is None:
+                return None
         values.append(float(value))
-        scores.append(None if score is None else float(score))
+        scores.append(score)
         pools.append(pool)
         if node is not None:
             node = int(node)
