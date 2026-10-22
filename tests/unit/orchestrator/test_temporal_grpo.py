@@ -51,6 +51,10 @@ def test_parse_rejects_bad_handoff():
     assert parse(pool="p") is None
     assert parse(score=0.5, pool=3) is None
     assert parse(score=0.5, pool="p").pools == ["p"]
+    # A score may be several named features, each a finite number.
+    assert parse(score={"tests": 3, "coverage": 0.5}).scores == [{"tests": 3.0, "coverage": 0.5}]
+    for bad in ({}, {"tests": "x"}, {"": 1.0}, {"tests": float("nan")}):
+        assert parse(score=bad) is None
 
 
 def test_parse_token_offsets():
