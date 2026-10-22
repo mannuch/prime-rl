@@ -305,6 +305,8 @@ def test_score_pools_require_agreement_within_a_stage():
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0], pool="p"), 1) == {1: "p"}
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1) is None
     assert score_pools(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1) is None
+    # The parser records an unscored completed stage as a None score, as on a stage with a value.
+    assert score_pools([StageRecord([5], 10, 0.0, stage_values=[0.5], stage_scores=[None])] * 2, 1) == {}
     # Completers must report the same features, and stages sharing a key the same ones.
     assert score_pools(scored([{"a": 0.0}], [1.0]) + scored([{"b": 1.0}], [0.0]), 1) is None
 
