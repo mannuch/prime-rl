@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 
 from prime_rl.orchestrator.algo import temporal_grpo as binary
-from prime_rl.orchestrator.algo.temporal_grpo import StageRecord
+from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, parse_stages
 from prime_rl.orchestrator.algo.temporal_grpo_continuous import (
     Fit,
     Moments,
+    collected_rewards,
     fit_handoff_values,
     score_pools,
     stage_advantages,
@@ -305,6 +306,8 @@ def test_score_pools_require_agreement_within_a_stage():
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0], pool="p"), 1) == {1: "p"}
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1) is None
     assert score_pools(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1) is None
+    # The parser records an unscored completed stage as a None score, as on a stage with a value.
+    assert score_pools([StageRecord([5], 10, 0.0, stage_values=[0.5], stage_scores=[None])] * 2, 1) == {}
     # Completers must report the same features, and stages sharing a key the same ones.
     assert score_pools(scored([{"a": 0.0}], [1.0]) + scored([{"b": 1.0}], [0.0]), 1) is None
 
@@ -349,3 +352,33 @@ def test_stage_lambda_one_is_return_to_go():
     assert spans(adv[0]) == [(1.75, 10), (1.0, 20), (0.5, 10)]
     # Its return-to-go from "grasp" on equals the group's, so those stages are neutral.
     assert spans(adv[3]) == [(0.75, 10), (0.0, 20), (-0.5, 10)]
+
+
+def test_parsed_records_run_through_the_fit():
+    # The parser fills every per-stage field, with None or defaults where an entry is silent,
+    # while the tests above leave fields None. A group mixing every kind of entry, parsed as
+    # stage_records does, must fit and conserve credit.
+    def raw(scores, failed_at):
+        entries = [
+            {"name": "a", "token": 10, "value": 0.5},
+            {"name": "b", "token": 20, "reward": 0.3},
+            {"name": "c", "token": 30, "score": scores[0]},
+            {"name": "d", "token": 40, "score": {"x": scores[1], "y": scores[2]}, "pool": "p"},
+        ]
+        for entry in entries[failed_at:]:
+            entry.update(token=None, value=None, score=None, pool=None)
+        return entries
+
+    group = [([0.0, 1.0, 0.0], 4, 1.0), ([1.0, 0.0, 1.0], 4, 0.0), ([2.0, 2.0, 0.0], 4, 1.0)]
+    group += [([3.0, 1.0, 1.0], 4, 0.0), ([0.5, 3.0, 2.0], 4, 1.0), ([0.0, 0.0, 0.0], 1, 0.0)]
+    records = []
+    for scores, failed_at, reward in group:
+        parsed = parse_stages(raw(scores, failed_at), [(0, 50)], num_nodes=1)
+        records.append(StageRecord(parsed.boundaries, 50, reward, *parsed[2:]))
+    pools = score_pools(records, 4)
+    assert pools == {3: None, 4: "p"}
+    filled, _, _ = fit_handoff_values(records, 4, pools, {})
+    adv = stage_advantages(filled, 4)
+    returns = [sum(collected_rewards(r, 4)) for r in records]
+    for record, tokens, total in zip(filled, adv, returns, strict=True):
+        assert sum(stage_values(record, tokens)) == pytest.approx(total - sum(returns) / len(returns))

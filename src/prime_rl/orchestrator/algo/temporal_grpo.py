@@ -76,6 +76,8 @@ class StageRecord:
         if self.stage_scores is None or not 1 <= k <= len(self.boundaries):
             return None
         score = self.stage_scores[k - 1]
+        if score is None:
+            return None
         return score if isinstance(score, dict) else {"": float(score)}
 
     def stage_pool(self, k: int) -> str | None:
