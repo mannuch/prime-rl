@@ -249,12 +249,20 @@ import verifiers.v1 as vf
 from prime_rl.configs.algorithm import TemporalGRPOContinuousAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm, iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import assign_advantages
-from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, grpo_credit, stage_records
-from prime_rl.utils.logger import get_logger
+from prime_rl.orchestrator.algo.temporal_grpo import (
+    FALLBACK_REASONS,
+    StageRecord,
+    StageRecordError,
+    fall_back,
+    record_fallback,
+    stage_records,
+)
 
 if TYPE_CHECKING:
     from prime_rl.orchestrator.clients import InferenceClient
 
+
+CONTINUOUS_FALLBACK_REASONS = (*FALLBACK_REASONS, "scores_differ")
 
 Point = tuple[np.ndarray, float]  # (score features, downstream return)
 
@@ -440,23 +448,31 @@ def collected_rewards(record: StageRecord, num_intermediate: int) -> list[float]
     return q
 
 
-def score_pools(records: list[StageRecord], num_intermediate: int) -> dict[int, str | None] | None:
-    """The pool key of each scored stage, or None when a stage's completers
-    disagree on whether it is scored, on its features or on its key, or when
-    stages sharing a key have different features."""
+def score_pools(records: list[StageRecord], num_intermediate: int) -> dict[int, str | None]:
+    """The pool key of each scored stage. Raises ``StageRecordError`` when a
+    stage's completers disagree on whether it is scored, on its features or on
+    its key, or when stages sharing a key have different features."""
+
+    def differ(detail: str) -> StageRecordError:
+        return StageRecordError("scores_differ", detail)
+
     pools: dict[int, str | None] = {}
     features: dict[str, tuple[str, ...]] = {}
     for k in range(1, num_intermediate + 1):
         completers = [record for record in records if len(record.boundaries) >= k]
         names = {None if (score := record.stage_score(k)) is None else tuple(sorted(score)) for record in completers}
         keys = {record.stage_pool(k) for record in completers}
-        if len(names) > 1 or len(keys) > 1:
-            return None
+        if None in names and len(names) > 1:
+            raise differ(f"intermediate stage {k}: some completers carry a score and some don't")
+        if len(names) > 1:
+            raise differ(f"intermediate stage {k}: completers' score features differ: {sorted(names)}")
+        if len(keys) > 1:
+            raise differ(f"intermediate stage {k}: completers' pool keys differ: {sorted(keys, key=str)}")
         if names in ({None}, set()):
             continue
         stage_names, key = names.pop(), keys.pop()
         if key is not None and features.setdefault(key, stage_names) != stage_names:
-            return None
+            raise differ(f"pool key {key!r}: stages report different score features")
         pools[k] = key
     return pools
 
@@ -607,16 +623,12 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         if not traces:
             return
-        group = stage_records(traces, self.stage_key, self.success_threshold)
-        if group is None:
-            return grpo_credit(traces)
-        records, stage_names = group
-        pools = score_pools(records, len(stage_names))
-        if pools is None:
-            get_logger().debug(
-                "temporal_grpo_continuous: plain GRPO credit for group (stage scores or pool keys differ within the group)"
-            )
-            return grpo_credit(traces)
+        try:
+            records, stage_names = stage_records(traces, self.stage_key, self.success_threshold)
+            pools = score_pools(records, len(stage_names))
+        except StageRecordError as error:
+            return fall_back(traces, error, CONTINUOUS_FALLBACK_REASONS)
+        record_fallback(traces, None, CONTINUOUS_FALLBACK_REASONS)
         # A key's history is kept per feature set, so an env that changes its features starts afresh.
         features = {key: score_features(records, k) for k, key in pools.items() if key is not None}
         priors = {key: self.pooled.get((key, names), Moments.empty(len(names))) for key, names in features.items()}

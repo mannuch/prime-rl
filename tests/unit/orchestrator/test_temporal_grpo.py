@@ -2,7 +2,7 @@
 
 import pytest
 
-from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, parse_stages, stage_advantages
+from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, StageRecordError, parse_stages, stage_advantages
 
 
 def spans(values):
@@ -16,6 +16,14 @@ def spans(values):
     return [(round(v, 4), n) for v, n in out]
 
 
+def rejects(raw, turns, num_nodes):
+    """The detail of the malformed-record error parse_stages raises."""
+    with pytest.raises(StageRecordError) as error:
+        parse_stages(raw, turns, num_nodes)
+    assert error.value.reason == "malformed_record"
+    return str(error.value)
+
+
 def test_parse_nodes_and_prerequisites():
     # Sampled assistant nodes at trace.nodes positions 1, 3, 5, 7 (prompts/tool results in between).
     turns = [(1, 10), (3, 20), (5, 30), (7, 40)]
@@ -27,34 +35,37 @@ def test_parse_nodes_and_prerequisites():
 
 
 def test_parse_rejects_bad_turn():
-    assert parse_stages([{"name": "a", "node": 9}], [(1, 5)], num_nodes=3) is None
-    assert parse_stages([{"name": "a", "node": 1, "reward": "x"}], [(1, 5)], num_nodes=3) is None
-    assert parse_stages([{"name": "a", "node": 1, "value": "x"}], [(1, 5)], num_nodes=3) is None
-    assert parse_stages([{"name": "a", "node": 1, "score": "x"}], [(1, 5)], num_nodes=3) is None
+    assert rejects([{"name": "a", "node": 9}], [(1, 5)], num_nodes=3)
+    assert rejects([{"name": "a", "node": 1, "reward": "x"}], [(1, 5)], num_nodes=3)
+    assert rejects([{"name": "a", "node": 1, "value": "x"}], [(1, 5)], num_nodes=3)
+    assert rejects([{"name": "a", "node": 1, "score": "x"}], [(1, 5)], num_nodes=3)
     # A non-finite number would poison every advantage in the group.
     for field in ("reward", "value", "score"):
-        assert parse_stages([{"name": "a", "node": 1, field: float("nan")}], [(1, 5)], num_nodes=3) is None
-        assert parse_stages([{"name": "a", "node": 1, field: float("inf")}], [(1, 5)], num_nodes=3) is None
-    assert parse_stages(None, [(1, 5)], num_nodes=3) is None
+        assert rejects([{"name": "a", "node": 1, field: float("nan")}], [(1, 5)], num_nodes=3)
+        assert rejects([{"name": "a", "node": 1, field: float("inf")}], [(1, 5)], num_nodes=3)
+    assert rejects(None, [(1, 5)], num_nodes=3)
 
 
 def test_parse_rejects_bad_handoff():
     def parse(**fields):
         return parse_stages([{"name": "a", "node": 1, **fields}], [(1, 5)], num_nodes=3)
 
+    def rejected(**fields):
+        return rejects([{"name": "a", "node": 1, **fields}], [(1, 5)], num_nodes=3)
+
     # A failed stage hands nothing off.
-    assert parse_stages([{"name": "a", "node": None, "value": 0.5}], [(1, 5)], num_nodes=3) is None
-    assert parse_stages([{"name": "a", "node": None, "score": 0.5}], [(1, 5)], num_nodes=3) is None
+    assert rejects([{"name": "a", "node": None, "value": 0.5}], [(1, 5)], num_nodes=3)
+    assert rejects([{"name": "a", "node": None, "score": 0.5}], [(1, 5)], num_nodes=3)
     # A handoff is forecast by the env or fitted from its score, not both.
-    assert parse(value=0.5, score=0.5) is None
+    assert rejected(value=0.5, score=0.5) == "stage 'a' carries both a value and a score"
     # A pool key shares a score's fit, so it needs a score, and it must be a string.
-    assert parse(pool="p") is None
-    assert parse(score=0.5, pool=3) is None
+    assert rejected(pool="p")
+    assert rejected(score=0.5, pool=3)
     assert parse(score=0.5, pool="p").pools == ["p"]
     # A score may be several named features, each a finite number.
     assert parse(score={"tests": 3, "coverage": 0.5}).scores == [{"tests": 3.0, "coverage": 0.5}]
     for bad in ({}, {"tests": "x"}, {"": 1.0}, {"tests": float("nan")}):
-        assert parse(score=bad) is None
+        assert rejected(score=bad)
 
 
 def test_parse_token_offsets():

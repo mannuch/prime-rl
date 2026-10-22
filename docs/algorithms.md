@@ -463,6 +463,18 @@ trajectory_weight = 0.0   # >0 blends back trajectory credit when early choices 
 
 Every trace in a group must report the same stage list; a group with a missing or inconsistent record, or a success whose record misses a stage, falls back to plain GRPO credit. The final stage covers only the tokens after the last intermediate boundary: if a rollout completes its last intermediate stage on its final turn, the task-reward comparison has no tokens to land on for that rollout. Credit each stage to the turn that caused it, and keep the task's last piece of real work out of the intermediate list.
 
+A fallback is easy to miss, since the group still trains, so every trace the algorithm scores is flagged. `temporal_grpo/fallback` is 1 when the trace's group got plain GRPO credit and 0 when it got stage credit, so its mean is the fallback rate. `temporal_grpo/fallback/<reason>` is 1 for the cause:
+
+| Reason | The group fell back because |
+|---|---|
+| `missing_record` | a trace has no record under `info[stage_key]` |
+| `malformed_record` | a record isn't a list of named entries, or an entry has a bad field: a `reward`, `value`, `score` or `token` that isn't a finite number (or, for `score`, a dict of them), a `node` outside the trace, a `pool` that isn't a string or comes without a `score`, both a `value` and a `score`, or a `value`, `score` or `pool` on a stage that wasn't completed |
+| `stage_lists_differ` | traces list different stages |
+| `success_without_stages` | a trace reached `success_threshold` without completing every stage |
+| `scores_differ` | `temporal_grpo_continuous` only: a stage's completers disagree on whether it is scored, on its score features or on its `pool` key, or stages under one key report different features |
+
+The debug log line `temporal_grpo: plain GRPO credit for group (<reason>: <detail>)` names the rollout, stage and field.
+
 ### Temporal GRPO with continuous stage rewards
 
 `temporal_grpo` ranks a stage's entrants by a binary outcome: did they complete it. `temporal_grpo_continuous` lets each stage pay a scalar reward and credits a stage with its TD error against the group's stage values. Stage *k*'s advantage for a rollout is `q_k + V_{k+1}·completed_k − V_k`, where `q_k` is the reward it collected in stage *k* and `V_k` is the mean reward-to-go of the rollouts that entered stage *k*. Unnormalized (`std_normalize = false`, the default), a rollout's stage advantages sum to its return minus the group mean, so the rule redistributes GRPO's credit to the stages that earned it rather than changing the objective. `std_normalize = true` divides each stage's TD errors by their std over the stage's entrants; with binary stage rewards that is exactly the paper's rule. The derivation is in the module docstring of `temporal_grpo_continuous.py`.
@@ -478,7 +490,7 @@ The record is the `trace.info["stages"]` list `temporal_grpo` reads: the task's 
 | `value` | How much is still to be earned from that state, in reward units | Completed stages | None | Pays the stage and charges the next one; never changes a rollout's total |
 | `pool` | Which fits share one set of weights | Entries with a `score` | None | Shares the fit across the stages of a group, and across groups |
 
-An entry carries `score` or `value`, never both, and within a group a stage's completers all carry a `score` or none do, with the same feature names when it is a dict. A fitted score can't do much harm: each rollout's weights are fit without its own outcome, weights within about a standard error of zero shrink toward no shaping, and shaping never changes a rollout's total. Entries that share a `pool` key share one fit: the stages of a group fit together, and earlier groups' fits are kept for about `1 / (1 − score_decay)` groups. What a key means is your call. Use the task's identity (`f"{task_id}/grasp"`) to pool a task with itself, and one key for a family of tasks only when the score means the same thing across it. Pooled fits live in orchestrator memory and start empty after a restart.
+An entry carries `score` or `value`, never both, and within a group a stage's completers all carry a `score` or none do, with the same feature names when it is a dict; otherwise the group falls back to plain GRPO credit (see the fallback reasons under [Temporal GRPO](#temporal-grpo)). A fitted score can't do much harm: each rollout's weights are fit without its own outcome, weights within about a standard error of zero shrink toward no shaping, and shaping never changes a rollout's total. Entries that share a `pool` key share one fit: the stages of a group fit together, and earlier groups' fits are kept for about `1 / (1 − score_decay)` groups. What a key means is your call. Use the task's identity (`f"{task_id}/grasp"`) to pool a task with itself, and one key for a family of tasks only when the score means the same thing across it. Pooled fits live in orchestrator memory and start empty after a restart.
 
 Stage rewards add to `trace.reward`, so don't also fold them into the rubric. `success_threshold` reads `trace.reward` alone. A completed stage with `reward: 0` still earns the next stage's group value: completion is structural, the reward only the scalar.
 
