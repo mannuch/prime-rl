@@ -106,6 +106,19 @@ def _finite(x: Any) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(x)
 
 
+class StageRecordError(ValueError):
+    """Why a group gets plain GRPO credit instead of stage credit. ``reason`` is
+    one of ``FALLBACK_REASONS`` (or an algorithm's own), for the fallback
+    metrics; the message says which rollout, stage and field."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+
+
+FALLBACK_REASONS = ("missing_record", "malformed_record", "stage_lists_differ", "success_without_stages")
+
+
 def _parse_score(score: Any) -> Score | None:
     """A number, or a non-empty dict of finite numbers under non-empty names; None if malformed."""
     if isinstance(score, dict):
@@ -115,11 +128,16 @@ def _parse_score(score: Any) -> Score | None:
     return float(score) if _finite(score) else None
 
 
-def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> ParsedStages | None:
+def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> ParsedStages:
     """The record's stages, with the reward of each entered intermediate stage
-    and the handoff fields of each completed one, or None if malformed."""
+    and the handoff fields of each completed one. Raises ``StageRecordError``
+    if malformed."""
+
+    def malformed(detail: str) -> StageRecordError:
+        return StageRecordError("malformed_record", detail)
+
     if not isinstance(raw, list) or not all(isinstance(entry, dict) and "name" in entry for entry in raw):
-        return None
+        raise malformed("the stage record is not a list of entries that each have a name")
     total = sum(length for _, length in turns)
     names = [str(entry["name"]) for entry in raw]
     boundaries: list[int] = []
@@ -127,41 +145,47 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
     values: list[float] = []
     scores: list[Score | None] = []
     pools: list[str | None] = []
-    for entry in raw:
+    for name, entry in zip(names, raw, strict=True):
         node, token = entry.get("node"), entry.get("token")
         completed = node is not None or token is not None
         reward = entry.get("reward")
         if reward is None:
             reward = float(completed)
         if not _finite(reward):
-            return None
+            raise malformed(f"stage {name!r}: reward {reward!r} is not a finite number")
         rewards.append(float(reward))
         value, score, pool = entry.get("value"), entry.get("score"), entry.get("pool")
         if not completed:
             if value is not None or score is not None or pool is not None:
-                return None  # a failed stage hands nothing off
+                raise malformed(f"stage {name!r} was not completed but carries a value, score or pool")
             break  # first uncompleted stage: later stages are unreached
         if value is not None and score is not None:
-            return None  # a handoff is either forecast by the env or fitted from its score, not both
-        if pool is not None and (score is None or not isinstance(pool, str)):
-            return None
+            raise malformed(f"stage {name!r} carries both a value and a score")
+        if pool is not None and score is None:
+            raise malformed(f"stage {name!r} carries a pool key but no score")
+        if pool is not None and not isinstance(pool, str):
+            raise malformed(f"stage {name!r}: pool {pool!r} is not a string")
         if value is None:
             value = 0.0
         if not _finite(value):
-            return None
+            raise malformed(f"stage {name!r}: value {value!r} is not a finite number")
         if score is not None:
-            score = _parse_score(score)
-            if score is None:
-                return None
+            parsed_score = _parse_score(score)
+            if parsed_score is None:
+                raise malformed(
+                    f"stage {name!r}: score {score!r} is neither a finite number nor a dict of them under non-empty names"
+                )
+            score = parsed_score
         values.append(float(value))
         scores.append(score)
         pools.append(pool)
         if node is not None:
-            node = int(node)
-            if not 0 <= node < num_nodes:
-                return None
-            end = sum(length for index, length in turns if index <= node)
+            if not _finite(node) or not 0 <= int(node) < num_nodes:
+                raise malformed(f"stage {name!r}: node {node!r} is not an index into the trace's {num_nodes} nodes")
+            end = sum(length for index, length in turns if index <= int(node))
         else:
+            if not _finite(token):
+                raise malformed(f"stage {name!r}: token {token!r} is not a number")
             end = min(max(int(token), 0), total)
         # A stage is only checked after its prerequisite, so it cannot end earlier.
         boundaries.append(max(end, boundaries[-1] if boundaries else 0))
@@ -170,23 +194,33 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
 
 def stage_records(
     traces: list[vf.Trace], stage_key: str, success_threshold: float
-) -> tuple[list[StageRecord], list[str]] | None:
-    """Every trace's record plus the group's stage names, or None (reason
-    logged) when the group has no consistent stage record to credit by."""
+) -> tuple[list[StageRecord], list[str]]:
+    """Every trace's record plus the group's stage names. Raises
+    ``StageRecordError`` when the group has no consistent stage record to
+    credit by."""
     records: list[StageRecord] = []
     stage_names: list[str] | None = None
-    for trace in traces:
+    for i, trace in enumerate(traces):
+        raw = trace.info.get(stage_key)
+        if raw is None:
+            raise StageRecordError("missing_record", f"rollout {i} has no record under info[{stage_key!r}]")
         turns = sampled_turns(trace)
-        parsed = parse_stages(trace.info.get(stage_key), turns, len(trace.nodes))
-        if parsed is None:
-            return _unusable("missing or malformed stage record")
+        try:
+            parsed = parse_stages(raw, turns, len(trace.nodes))
+        except StageRecordError as error:
+            raise StageRecordError(error.reason, f"rollout {i}: {error}") from None
         if stage_names is None:
             stage_names = parsed.names
         elif parsed.names != stage_names:
-            return _unusable("stage lists differ within the group")
-        succeeded = trace.reward >= success_threshold
-        if succeeded and len(parsed.boundaries) < len(parsed.names):
-            return _unusable("task succeeded without completing every recorded stage")
+            raise StageRecordError(
+                "stage_lists_differ", f"rollout {i} lists stages {parsed.names}, rollout 0 lists {stage_names}"
+            )
+        if trace.reward >= success_threshold and len(parsed.boundaries) < len(parsed.names):
+            raise StageRecordError(
+                "success_without_stages",
+                f"rollout {i} succeeded (reward {trace.reward}) after completing "
+                f"{len(parsed.boundaries)} of {len(parsed.names)} stages",
+            )
         num_tokens = sum(length for _, length in turns)
         records.append(
             StageRecord(
@@ -203,8 +237,21 @@ def stage_records(
     return records, stage_names
 
 
-def _unusable(reason: str) -> None:
-    get_logger().debug(f"temporal_grpo: plain GRPO credit for group ({reason})")
+def record_fallback(traces: list[vf.Trace], reason: str | None, reasons: tuple[str, ...]) -> None:
+    """Flag every trace with whether its group fell back to plain GRPO credit,
+    and why. Each flag is recorded on every trace, 0 included, so its mean over
+    traces is a rate."""
+    metrics = {"temporal_grpo/fallback": float(reason is not None)}
+    metrics |= {f"temporal_grpo/fallback/{name}": float(name == reason) for name in reasons}
+    for trace in traces:
+        trace.record_metrics(metrics)
+
+
+def fall_back(traces: list[vf.Trace], error: StageRecordError, reasons: tuple[str, ...]) -> None:
+    """Plain GRPO credit for a group whose stage records can't be used, logged and flagged."""
+    get_logger().debug(f"temporal_grpo: plain GRPO credit for group ({error.reason}: {error})")
+    record_fallback(traces, error.reason, reasons)
+    grpo_credit(traces)
 
 
 def grpo_credit(traces: list[vf.Trace]) -> None:
@@ -285,10 +332,11 @@ class TemporalGRPOAlgorithm(Algorithm):
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         if not traces:
             return
-        group = stage_records(traces, self.stage_key, self.success_threshold)
-        if group is None:
-            return grpo_credit(traces)
-        records, stage_names = group
+        try:
+            records, stage_names = stage_records(traces, self.stage_key, self.success_threshold)
+        except StageRecordError as error:
+            return fall_back(traces, error, FALLBACK_REASONS)
+        record_fallback(traces, None, FALLBACK_REASONS)
         per_token = stage_advantages(
             records,
             len(stage_names),

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from prime_rl.orchestrator.algo import temporal_grpo as binary
-from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, parse_stages
+from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, StageRecordError, parse_stages
 from prime_rl.orchestrator.algo.temporal_grpo_continuous import (
     Fit,
     Moments,
@@ -302,20 +302,30 @@ def test_pooled_slope_ignores_group_levels():
     assert Moments.of(low + high).fit().weights[0] < 0.5
 
 
+def scores_differ(records, num_intermediate):
+    """The detail of the error score_pools raises when a group's scores can't be fit."""
+    with pytest.raises(StageRecordError) as error:
+        score_pools(records, num_intermediate)
+    assert error.value.reason == "scores_differ"
+    return str(error.value)
+
+
 def test_score_pools_require_agreement_within_a_stage():
     assert score_pools(scored([0.0, 1.0], [1.0, 0.0], pool="p"), 1) == {1: "p"}
-    assert score_pools(scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1) is None
-    assert score_pools(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1) is None
+    assert "some completers carry a score" in scores_differ(
+        scored([0.0, 1.0], [1.0, 0.0]) + [StageRecord([5], 10, 0.0)], 1
+    )
+    assert scores_differ(scored([0.0], [1.0], pool="p") + scored([1.0], [0.0], pool="q"), 1)
     # The parser records an unscored completed stage as a None score, as on a stage with a value.
     assert score_pools([StageRecord([5], 10, 0.0, stage_values=[0.5], stage_scores=[None])] * 2, 1) == {}
     # Completers must report the same features, and stages sharing a key the same ones.
-    assert score_pools(scored([{"a": 0.0}], [1.0]) + scored([{"b": 1.0}], [0.0]), 1) is None
+    assert scores_differ(scored([{"a": 0.0}], [1.0]) + scored([{"b": 1.0}], [0.0]), 1)
 
     def two_stages(first, second):
         return [StageRecord([5, 10], 15, 0.0, stage_scores=[first, second], stage_pools=["p", "p"])]
 
     assert score_pools(two_stages({"a": 0.0}, {"a": 1.0}), 2) == {1: "p", 2: "p"}
-    assert score_pools(two_stages({"a": 0.0}, {"a": 1.0, "b": 2.0}), 2) is None
+    assert scores_differ(two_stages({"a": 0.0}, {"a": 1.0, "b": 2.0}), 2)
 
 
 def test_score_features_fit_jointly():
