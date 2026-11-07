@@ -266,6 +266,9 @@ CONTINUOUS_FALLBACK_REASONS = (*FALLBACK_REASONS, "scores_differ")
 
 Point = tuple[np.ndarray, float]  # (score features, downstream return)
 
+# A feature whose spread is this small relative to its size is constant: the spread is rounding.
+CONSTANT_FEATURE_TOLERANCE = 1e-12
+
 
 def pseudo_inverse(matrix: np.ndarray) -> tuple[np.ndarray, int]:
     """Inverse of a symmetric PSD matrix on its well-determined directions, and their number.
@@ -371,10 +374,12 @@ class Moments:
                 continue
             mean_x = sum(x for x, _ in points.values()) / len(points)
             mean_y = sum(y for _, y in points.values()) / len(points)
+            features = np.stack([x for x, _ in points.values()])
+            constant = np.ptp(features, axis=0) <= CONSTANT_FEATURE_TOLERANCE * np.abs(features).max(axis=0)
             dof += len(points) - 1
             num_points += len(points)
             for i, (x, y) in points.items():
-                dx, dy = x - mean_x, y - mean_y
+                dx, dy = np.where(constant, 0.0, x - mean_x), y - mean_y
                 xx, xy, yy = xx + np.outer(dx, dx), xy + dx * dy, yy + dy * dy
                 a, c = sums.get(i, (empty.xy, empty.xx))
                 sums[i] = (a + dx * dy, c + np.outer(dx, dx))

@@ -356,6 +356,22 @@ def test_a_constant_feature_drops_out_of_the_fit():
     assert [r.stage_values[0] for r in padded] == pytest.approx([r.stage_values[0] for r in alone])
     assert moments[1].fit().rank == 1
 
+    # The mean of this constant rounds, which must not turn it into a feature with a huge weight.
+    c = 0.0021885391101257425
+    carry = [-1.33 + 0.01 * i for i in range(15)]
+    fit = Moments.over([{i: ((c, x), 0.5 * x) for i, x in enumerate(carry)}]).fit()
+    assert fit.rank == 1
+    assert fit.weights == pytest.approx([0.0, 0.5])
+
+    # Leaving out the one rollout that differs makes the feature constant, so it is priced on "x" alone.
+    scores = [0.3 * i for i in range(15)]
+    rewards = [0.1 * s + 0.01 * (-1) ** i for i, s in enumerate(scores)]
+    alone, _, _ = fit_handoff_values(scored(scores, rewards), 1, {1: None}, {})
+    padded, _, _ = fit_handoff_values(
+        scored([{"x": s, "d": c + (i == 0)} for i, s in enumerate(scores)], rewards), 1, {1: None}, {}
+    )
+    assert padded[0].stage_values[0] == pytest.approx(alone[0].stage_values[0])
+
 
 def test_stage_lambda_one_is_return_to_go():
     adv = stage_advantages(LATE_FAILURE, 3, std_normalize=False, stage_lambda=1.0)
