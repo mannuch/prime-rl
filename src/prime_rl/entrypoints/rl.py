@@ -3,6 +3,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from prime_rl.configs.orchestrator import EnvConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.entrypoints.dashboard import ensure_dashboard, log_run_links, run_links
 from prime_rl.entrypoints.inference import mooncake_offloads, vllm_overrides_fragment, write_pd_configs
-from prime_rl.utils.config import cli, dump_resolved_config, dump_rl_components
+from prime_rl.utils.config import check_mode, cli, dump_resolved_config, dump_rl_components
 from prime_rl.utils.logger import get_logger, setup_logger
 from prime_rl.utils.pathing import (
     clean_future_steps,
@@ -49,6 +50,7 @@ ORCHESTRATOR_CONFIG = "orchestrator.json"
 INFERENCE_CONFIG = "inference.json"
 
 ENVS_DIR = "envs"
+ROLLOUT_STORE_DIR = Path(tempfile.gettempdir()) / "prime-rl-rollout-store"
 
 MODELEXPRESS_BIN_DIR = Path(__file__).resolve().parents[3] / "third_party" / "modelexpress" / "bin"
 MODELEXPRESS_READY_TIMEOUT_S = 120
@@ -170,8 +172,11 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
     # One EnvWorkerPoolConfig per launcher-managed source: `env-worker-pool @ <path>` binds an
     # OS-assigned port and publishes it to the source's address file, where the
     # orchestrator picks it up.
+    # Train pools of a retaining run keep their arrays on node-local disk, not in memory.
+    retain = config.rollout_transport is not None and config.rollout_transport.retain
     for split, source in env_worker_pools(config):
-        write_env_worker_pool_config(output_dir, split, source, config.orchestrator.log)
+        store_dir = ROLLOUT_STORE_DIR if retain and split == "train" else None
+        write_env_worker_pool_config(output_dir, split, source, config.orchestrator.log, store_dir)
 
 
 def rl_local(config: RLConfig):
@@ -262,9 +267,9 @@ def rl_local(config: RLConfig):
 
         frozen_endpoints: list[str] = []
         for env in config.orchestrator.train.source:
-            for ref in (env.algo.sampling.source, getattr(env.algo, "teacher", None)):
-                if isinstance(ref, FrozenModelConfig):
-                    frozen_endpoints.append(f"{ref.name} ({ref.base_url})")
+            ref = getattr(env.algo, "teacher", None)
+            if isinstance(ref, FrozenModelConfig):
+                frozen_endpoints.append(f"{ref.name} ({ref.base_url})")
         if frozen_endpoints:
             endpoints = ", ".join(dict.fromkeys(frozen_endpoints))
             logger.info(
@@ -607,6 +612,7 @@ def rl(config: RLConfig):
 
 def main():
     set_proc_title("Launcher")
+    check_mode("rl")
     rl(cli(RLConfig))
 
 
