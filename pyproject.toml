@@ -18,7 +18,7 @@ dependencies = [
     "wandb-workspaces>=0.4.3",
     "prime-runs[train]>=0.1.6",
     "pyzmq>=27.1.0",
-    "msgpack>=1.1.2",
+    "msgpack>=1.2.3",
     "aiolimiter>=1.2.1",
     "tenacity>=8.2.0",
     "openai>=1.106.1",
@@ -31,6 +31,7 @@ dependencies = [
     "uvloop>=0.21.0",
     "verifiers[harbor]>=0.4.1",
     "renderers[multimodal]>=0.2.0",
+    "pillow>=13.0.0",
     "pybase64>=1.4.2",
     "msgspec>=0.18",
     "fastapi>=0.115",
@@ -166,6 +167,9 @@ override-dependencies = [
     # unbatched send/recv to several peers on a group created without device_id (pytorch#201536).
     "nvidia-nccl-cu13==2.32.3 ; sys_platform == 'linux'",
     "openenv-core",
+    # enterprise-ops-gym and mcp-atlas cap datasets<5, which holds huggingface-hub,
+    # filelock and fsspec at versions with known vulnerabilities.
+    "datasets>=5.0.1",
 ]
 
 # prime-envs packages are auto-discovered as workspace members, so new
