@@ -74,9 +74,11 @@ single-node runs start one, and multi-node RL runs start one per inference node.
 Orchestrator
 └── Source (env configuration)
     ├── Pool replica 1: PRL::EnvBroker
+    │   ├── PRL::SampleServer
     │   ├── PRL::EnvWorker
     │   └── PRL::EnvWorker
     └── Pool replica 2: PRL::EnvBroker
+        ├── PRL::SampleServer
         └── PRL::EnvWorker
 ```
 
@@ -84,6 +86,16 @@ The orchestrator selects the least-loaded replica; its broker dispatches to the 
 worker. Each worker loads its own Verifiers env and can execute multiple episodes concurrently.
 The orchestrator loads the dataset and sends task data with each request. Even a one-worker
 pool has a broker and a separate worker process.
+
+Env workers keep the training samples of the train rollouts they run, and the orchestrator
+gets only a short record of each rollout, so its memory does not grow with rollout length.
+The samples live in the replica's sample server, which trainer ranks fetch them from. The
+orchestrator ships each step's samples by reference to every trainer rank, and each rank
+packs them into micro batches of at most `trainer.model.seq_len` tokens, balanced by
+training FLOPs across the data ranks, and fetches its own. The sample server also runs the
+algorithm's model calls on them, such as `opd`'s teacher prefills, for every env worker of
+the replica. `[serve.scoring]` bounds those calls in flight per replica (`max_concurrent`)
+and how often each is tried before its rollout fails (`attempts`).
 
 `[serve]` configures the pool's address, static/elastic worker count and per-worker episode
 concurrency. Each broker publishes its bound address under
@@ -327,7 +339,7 @@ num_train_gpus = 1  # trainer
 num_infer_gpus = 1  # inference
 ```
 
-The launcher starts the inference server, one env worker pool per eval source, and an online-eval process next to the trainer (it logs to `logs/attempt_<n>/eval.log`). NCCL is the default weight transport. The trainer broadcasts weights at startup (fail-fast) and at every step an eval env is due, Every broadcast runs the same four-stage handshake in `broadcasts/step_{n}`: the trainer offers the version (`.sender_ready`) and blocks, the online-eval process acknowledges (`.receiver_ready`), then the trainer transfers (`.started`) and commits (`.finished`). It runs the due envs sequentially per broadcast, so every epoch measures exactly one policy version. Set `[weight_broadcast] type = "filesystem"` to reload weights from disk instead. LoRA and externally managed inference use filesystem broadcast automatically. The base model is evaluated before the first step (disable with `eval.skip_first_step`), and the final broadcast always fires every env. In-flight eval episodes are cancelled by default when the next checkpoint is ready, so stale evals do not delay a weight update. Set `eval.cancel_on_new_checkpoint = false` to drain every triggered epoch instead. The trainer can idle while it waits for slow evals. They are sized by the same adaptive concurrency controller as the orchestrator; bound it with `[eval.concurrency]` (`min_inflight` / `max_inflight`; set them equal for fixed concurrency).
+The launcher starts the inference server, one env worker pool per eval source, and an online-eval process next to the trainer (it logs to `logs/attempt_<n>/eval.log`). NCCL is the default weight transport; set `[weight_broadcast] type = "modelexpress"` to send the weights through [ModelExpress](model-express.md) instead. The trainer broadcasts weights at startup (fail-fast) and at every step an eval env is due, Every broadcast runs the same four-stage handshake in `broadcasts/step_{n}`: the trainer offers the version (`.sender_ready`) and blocks, the online-eval process acknowledges (`.receiver_ready`), then the trainer transfers (`.started`) and commits (`.finished`). It runs the due envs sequentially per broadcast, so every epoch measures exactly one policy version. Set `[weight_broadcast] type = "filesystem"` to reload weights from disk instead. LoRA and externally managed inference use filesystem broadcast automatically. The base model is evaluated before the first step (disable with `eval.skip_first_step`), and the final broadcast always fires every env. In-flight eval episodes are cancelled by default when the next checkpoint is ready, so stale evals do not delay a weight update. Set `eval.cancel_on_new_checkpoint = false` to drain every triggered epoch instead. The trainer can idle while it waits for slow evals. They are sized by the same adaptive concurrency controller as the orchestrator; bound it with `[eval.concurrency]` (`min_inflight` / `max_inflight`; set them equal for fixed concurrency).
 
 #### Multi-Node Trainer and Inference Pool
 
@@ -346,7 +358,7 @@ tensor_parallel_size = 8
 job_name = "my-run"
 ```
 
-The shared script passes the trainer rank-0 hostname directly to the online-eval process for NCCL weight broadcasts. Each transfer is synchronous, but eval rollout execution overlaps with later training steps. The allocation remains active while the final eval finishes. Without `max_steps`, online-eval never sees a final broadcast, so the job remains active until walltime. Trainer and online-eval log to one shared W&B run. The trainer creates it, and online-eval finalizes it.
+The shared script passes the trainer rank-0 hostname directly to the online-eval process for NCCL weight broadcasts. With ModelExpress, it starts the server on the trainer head node and points the trainer and the online-eval process at it. Each transfer is synchronous, but eval rollout execution overlaps with later training steps. The allocation remains active while the final eval finishes. Without `max_steps`, online-eval never sees a final broadcast, so the job remains active until walltime. Trainer and online-eval log to one shared W&B run. The trainer creates it, and online-eval finalizes it.
 
 ### SFT-Specific Knobs
 
@@ -375,6 +387,7 @@ Pulled from the console log and mirrored to W&B.
 **Stability and optimization:**
 
 - `optim/grad_norm` — spikes precede divergence.
+- `optim/grad_norm/{group}` — the same norm per module group, to locate a spike: the block in a decoder layer (`self_attn`, `linear_attn`, `mlp`, or a MoE's `mlp.experts`, `mlp.router`, `mlp.shared_expert`), `norm` for every norm, and `embed_tokens`, `lm_head`. Their squares sum to the square of `optim/grad_norm`. Not logged with gradient offloading.
 - `optim/lr` — LR schedule.
 - For MoE: `max_vio/mean`, `max_vio/max` — mean and max over the step's microsteps of the largest load-balancing violation across layers and EP groups, computed from expert token counts summed across each EP group. `routing_confidence/mean` — mean routing confidence.
 - For MoE: `expert_load/{cv,max_mean,cold_frac}/{mean,max}` — expert load per layer over the whole step, from token counts summed across all ranks, as the mean and max over MoE layers. `cv` is std/mean of the per-expert token counts, `max_mean` the busiest expert's count over the mean, and `cold_frac` the fraction of experts receiving under 0.1x the mean. A trainable router that drifts shows up as a rising `cv`/`cold_frac` (MiMo-V2.6 §5.4).
@@ -473,7 +486,7 @@ Checkpointing is split across processes because the orchestrator and trainer can
 | Process | What's saved | Where |
 |---|---|---|
 | Trainer | FSDP-sharded model (DCP), optimizer, progress | `<run_dir>/checkpoints/step_{n}/trainer/` |
-| Orchestrator | Progress, per-env data state | `<run_dir>/checkpoints/step_{n}/orchestrator/` |
+| Orchestrator | Progress, per-env data state, and with `ckpt.rollouts` the rollouts | `<run_dir>/checkpoints/step_{n}/orchestrator/` |
 | Inference | _nothing_ — re-pushed from the latest checkpoint on restart | n/a |
 | Trainer, orchestrator, inference | The model's `config.json` and `generation_config.json`, the tokenizer files and a VLM's processor files | `<run_dir>/checkpoints/step_{n}/` |
 
@@ -546,6 +559,40 @@ To start a fresh schedule at a resume, set `scheduler.start_step` to the resume 
 - The open train groups: groups that were drawn but not shipped at the checkpoint. The checkpoint saves no partial groups, so a resume re-runs each one whole, before it draws new tasks. A re-run group goes through the curriculum again, with its new rollouts. A group that finished without training (for example, rejected by the curriculum) does not re-run.
 - A resume drops the open groups of a removed source or task. It also drops those of a streaming taskset, which cannot find a task by key.
 
+#### Checkpointing rollouts
+
+By default a resumed run starts with an empty pipeline. Set `--ckpt.rollouts` to also checkpoint the train rollouts:
+
+```bash
+uv run rl @ rl.toml --ckpt.interval 25 --ckpt.rollouts
+```
+
+The orchestrator then saves step N when the trainer publishes the weights of N, before inference applies them. The checkpoint holds the pipeline of that moment, so a resumed run ships the batches that the first run would have shipped.
+
+A resume restores:
+
+- The finished episodes that did not ship: the episodes in the result queue, the groups that still collect episodes, the traces queued for a batch, and a batch that the trainer did not take yet. Their training arrays are in `step_{n}/orchestrator/rollouts/arrays/`.
+- The open train groups, with the number of episodes that each group still owes. A resume does not re-run them whole.
+- The running rollouts. Each env worker takes a memory checkpoint of the sandbox of each running rollout and writes a restore file to `step_{n}/orchestrator/rollouts/`. The resumed run continues each rollout in a new sandbox, before it starts new work. An env worker pool reads and writes these files only in its `--output-dir`. The launchers set it to the run directory. If you start a pool yourself, set it to the run directory too.
+- The in-flight limit of the concurrency controller.
+
+These start over:
+
+- A running rollout that cannot take a memory checkpoint. The resumed run runs its task from the start, in the same group. Restore points cover single-agent episodes with one harness on Prime sandboxes. These rollouts take none:
+  - A rollout on a runtime without memory snapshots, for example the subprocess runtime.
+  - A rollout of a harness that cannot continue from a memory snapshot. The null, bash and ACP harnesses (for example rlm) can.
+  - A rollout of an episode with more than one agent run.
+  - A rollout whose task has tool servers, shared tools or services of its own.
+  - A rollout that has not booted its sandbox yet, or that is in setup or scoring.
+- A running rollout whose env worker pool did not answer within `ckpt.rollouts_save_timeout` seconds (600 by default). The pool's other rollouts start over too, even those whose memory checkpoint was taken. The trainer waits in its weight broadcast for the whole save, so a longer timeout trades a longer pause at each checkpoint for fewer rollouts that start over.
+- All eval rollouts. Eval epochs are not checkpointed.
+
+The orchestrator logs one line per checkpoint with the episode counts, the time of each phase and the size on disk. The same values are in the `ckpt/rollouts/*` metrics.
+
+The memory checkpoints are sandbox snapshots, and the run that takes them owns them. The file `checkpoints/rollout_snapshots.json` records the snapshots of each checkpoint step. After each checkpoint and at a clean shutdown, the orchestrator deletes the snapshots of the steps whose directory is gone (`keep_last` and `keep_interval` remove whole step directories). At a clean shutdown it also deletes the snapshots of the steps that `keep_last` and `keep_interval` remove once the trainer has written its last checkpoint. The snapshots of a checkpoint that stays on disk stay too. If you delete a run directory by hand, delete its snapshots on the sandbox provider as well. A run that forks another run's checkpoint with `--resume.dir` never deletes the snapshots of that run.
+
+A checkpoint that has rollouts resumes without them when `ckpt.rollouts` is off: the open groups re-run whole.
+
 #### Changing sources on resume
 
 A resume can add, remove or change train and eval sources.
@@ -601,6 +648,8 @@ curl -X POST localhost:8041/v1/actions -H "$AUTH" -H 'content-type: application/
 ```
 
 Once paused, both keep serving the API until the run is stopped, so its owner can read the committed step first.
+
+With `ckpt.rollouts`, the orchestrator saves N with its rollouts when the trainer publishes the weights of N. Send the orchestrator its request before that moment. A later request saves the state as of shipping N, without rollouts.
 
 A `checkpoint` action takes the same two calls and saves step N without stopping the run. Since the trainer keeps going, the orchestrator has to receive its request before the trainer finishes N and requests N + 1; a later request gets a 409 because the orchestrator no longer has the state of N:
 
@@ -716,7 +765,7 @@ Monitors receive the run's metrics and episodes. The file monitor is on by defau
 
 The file monitor writes the run's metrics (`metrics.jsonl`) and trace stream under `<run_dir>/monitors/file/`, and feeds the local [dashboard](#dashboard). Turn it off with `--no-monitors.file`.
 
-On a large run the traces dominate what the monitor writes. `--monitors.file.trace-sample 0.1` keeps the traces (episodes, live traces, and the orchestrator's annotations) of one train group in ten, chosen by group id so each written group is complete; metrics and eval episodes are always written. `--no-monitors.file.live` stops the live traces: one file per in-flight trace under `traces/live/`, appended on every turn, which feed the dashboard's live view. Episodes are then written once, when they finish.
+On a large run the traces dominate what the monitor writes. `--monitors.file.trace-sample 0.1` keeps the traces (episodes, live traces, and the orchestrator's annotations) of one train group in ten, chosen by group id so each written group is complete; metrics and eval episodes are always written. `--no-monitors.file.live` stops the live traces: one file per in-flight trace under `traces/live/`, appended on every turn, which feed the dashboard's live view. Episodes are then written once, when they finish, and the env worker pools stream only each rollout's progress to the orchestrator, not its messages.
 
 ### Weights & Biases
 
