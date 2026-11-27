@@ -7,6 +7,7 @@ from pydantic import Field, field_validator, model_validator
 
 from prime_rl.configs.monitors import MonitorsConfig
 from prime_rl.configs.shared import (
+    BaseCheckpointConfig,
     BaseModelConfig,
     ControlConfig,
     EnvVars,
@@ -15,7 +16,6 @@ from prime_rl.configs.shared import (
     HeartbeatConfig,
     ResumeConfig,
     TrainerLogConfig,
-    TransportConfig,
     VLMConfig,
     WeightBroadcastConfig,
     ZMQTransportConfig,
@@ -207,8 +207,27 @@ class MXFP8MoEComputeConfig(MoEComputeConfigBase):
     """MXFP8 expert-compute recipe."""
 
 
+class NVFP4MoEComputeConfig(MoEComputeConfigBase):
+    """Run routed experts with the numerics of vLLM's online ``nvfp4_per_token`` MoE: NVFP4 forward with per-token
+    activation scales and the engines' load-time weight quantizer, MXFP8 backward on the dequantized operands (SM100).
+    In ``rl`` the engines must run ``quantization = "online"`` with ``quantization_config.moe = "nvfp4_per_token"``."""
+
+    type: Literal["nvfp4"] = "nvfp4"
+    four_over_six: bool = False
+    """Choose each activation block's scale with 4/6 (the lower-error of the max-6 and max-4 scales), as FlashInfer's
+    ``FLASHINFER_NVFP4_4OVER6``. ``rl`` applies the same setting to the engines. Weights never use it."""
+
+    @property
+    def flashinfer_env(self) -> dict[str, str]:
+        """FlashInfer quantizer settings the trainer and the engines share: IEEE division, 4/6 on or off."""
+        return {
+            "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH": "1",
+            "FLASHINFER_NVFP4_4OVER6": "1" if self.four_over_six else "0",
+        }
+
+
 MoEComputeConfig: TypeAlias = Annotated[
-    BF16MoEComputeConfig | DeepGemmFP8MoEComputeConfig | MXFP8MoEComputeConfig,
+    BF16MoEComputeConfig | DeepGemmFP8MoEComputeConfig | MXFP8MoEComputeConfig | NVFP4MoEComputeConfig,
     Field(discriminator="type"),
 ]
 
@@ -626,19 +645,7 @@ class SignSGDConfig(BaseOptimizerConfig):
 OptimizerConfig: TypeAlias = Annotated[AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")]
 
 
-class CheckpointConfig(BaseConfig):
-    output_dir: Path | None = None
-    """Override directory for checkpoints. If set, checkpoints are written here instead of under the trainer ``output_dir`` — useful for writing large checkpoints to a separate storage volume."""
-
-    interval: int | None = Field(None, ge=1)
-    """Interval at which to save the training checkpoint. If None, only checkpoints at the end of training."""
-
-    keep_last: int | None = Field(None, ge=1)
-    """Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency."""
-
-    keep_interval: int | None = Field(None, ge=1)
-    """Keep checkpoints at every N steps permanently (e.g. ``keep_interval=100`` keeps step 100, 200, ...). If None, no interval-based keeping."""
-
+class CheckpointConfig(BaseCheckpointConfig):
     skip_dataloader: bool = False
     """Skip loading the dataloader from checkpoint."""
 
@@ -732,6 +739,9 @@ class DataLoaderConfig(BaseConfig):
 
     num_workers: int = Field(1, ge=0)
     """Number of background threads that prepare micro batches ahead of the training loop, analogous to torch DataLoader's ``num_workers`` but with threads instead of processes. 0 prepares them on the main thread."""
+
+    pad_to_seq_len: bool = False
+    """Pad every micro batch to ``model.seq_len`` instead of to a multiple of the context-parallel degree. Rows then have one static shape, which avoids recompilation on dynamic sequence lengths (torch.compile, DeepGEMM JIT kernels, ...) at the cost of extra padding."""
 
 
 class BaseTrainerConfig(BaseConfig):
@@ -857,7 +867,7 @@ class TrainerConfig(BaseTrainerConfig):
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
     """Transport used to broadcast updated weights from trainer to inference."""
 
-    rollout_transport: TransportConfig = ZMQTransportConfig()
+    rollout_transport: ZMQTransportConfig = ZMQTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""
 
     monitors: MonitorsConfig = MonitorsConfig()
@@ -882,7 +892,7 @@ class TrainerConfig(BaseTrainerConfig):
 
     @model_validator(mode="after")
     def validate_lora_broadcast(self):
-        if self.model.lora is not None and self.weight_broadcast.type in ("nccl", "nixl", "modelexpress"):
+        if self.model.lora is not None and self.weight_broadcast.type in ("nccl", "modelexpress"):
             raise ValueError(
                 "LoRA requires weight_broadcast.type = 'filesystem': vLLM loads adapters only from a "
                 "PEFT-shaped directory on disk - in-memory transports have no disk artifact to load from."

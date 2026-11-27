@@ -248,17 +248,19 @@ import verifiers.v1 as vf
 
 from prime_rl.configs.algorithm import TemporalGRPOContinuousAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm, iter_trainable_traces
-from prime_rl.orchestrator.algo.routing import assign_advantages
 from prime_rl.orchestrator.algo.temporal_grpo import (
     FALLBACK_REASONS,
     StageRecord,
     StageRecordError,
+    assign_stage_credit,
     fall_back,
     record_fallback,
     stage_records,
+    summarize_stages,
 )
 
 if TYPE_CHECKING:
+    from prime_rl.env.heads import EpisodeHead, TraceHead
     from prime_rl.orchestrator.clients import InferenceClient
 
 
@@ -624,12 +626,15 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
         # Per ``pool`` key and score features: moments from earlier groups, decayed.
         self.pooled: dict[tuple[str, tuple[str, ...]], Moments] = {}
 
-    async def score_group(self, episodes: list[vf.Episode]) -> None:
+    async def score_episode(self, episode: vf.Episode) -> None:
+        summarize_stages(episode, self.stage_key)
+
+    async def score_group(self, episodes: list[EpisodeHead]) -> None:
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         if not traces:
             return
         try:
-            records, stage_names = stage_records(traces, self.stage_key, self.success_threshold)
+            records, stage_names = stage_records(traces, self.success_threshold)
             pools = score_pools(records, len(stage_names))
         except StageRecordError as error:
             return fall_back(traces, error, CONTINUOUS_FALLBACK_REASONS)
@@ -651,11 +656,11 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
             stage_lambda=self.stage_lambda,
         )
         for trace, values in zip(traces, per_token, strict=True):
-            assign_advantages(trace, values)
+            assign_stage_credit(trace, values)
 
     @staticmethod
     def _record_fits(
-        traces: list[vf.Trace],
+        traces: list[TraceHead],
         records: list[StageRecord],
         stage_names: list[str],
         pools: dict[int, str | None],
@@ -686,4 +691,4 @@ class TemporalGRPOContinuousAlgorithm(Algorithm):
             mean = sum(values) / len(values)
             fits[f"stage/{name}/score_value_std"] = math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
         for trace in traces:
-            trace.record_metrics(fits)
+            trace.metrics.update(fits)

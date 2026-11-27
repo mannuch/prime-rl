@@ -16,7 +16,8 @@ The env declares stage progress. Each trace carries, in
 whose action completed the stage; the stage's interval ends after that turn's
 tokens. ``None`` means never completed. ``token`` may be given instead of
 ``node``: an exclusive end offset into the trace's sampled-token stream (the
-order ``assign_advantages`` walks), for stages inside one long response. Stages
+sampled tokens of its trainable nodes, in ``trace.nodes`` order, each node
+once), for stages inside one long response. Stages
 are linear prerequisites, so everything after the first uncompleted stage is
 ignored. The final stage is implicit: the task reward itself, over the tokens
 after the last intermediate stage — so the task objective is preserved exactly.
@@ -26,6 +27,11 @@ expected from the state it handed off, or a ``score`` of that state (a number,
 or a dict of named numbers, with an optional ``pool`` key) for the algorithm to
 calibrate; this binary rule ignores them all (``temporal_grpo_continuous`` is
 the rule that uses them).
+
+The record is read where the rollout ran: ``score_episode``, in the env worker,
+parses it against the trace's message graph and leaves the result (or why it
+can't be used) under ``trace.info[ALGO_INFO_KEY]``, which the trace's head
+carries to ``score_group`` on the orchestrator.
 """
 
 from __future__ import annotations
@@ -34,14 +40,18 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import numpy as np
 import verifiers.v1 as vf
 
 from prime_rl.configs.algorithm import TemporalGRPOAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm, iter_trainable_traces
-from prime_rl.orchestrator.algo.routing import assign_advantages, trainable_nodes
+from prime_rl.orchestrator.algo.routing import assign_advantage, assign_advantages, token_layout, trainable_nodes
+from prime_rl.orchestrator.credit import ALGO_INFO_KEY
+from prime_rl.orchestrator.trajectories import iter_trainable_branches
 from prime_rl.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from prime_rl.env.heads import EpisodeHead, TraceHead
     from prime_rl.orchestrator.clients import InferenceClient
 
 
@@ -97,9 +107,30 @@ class ParsedStages(NamedTuple):
 
 def sampled_turns(trace: vf.Trace) -> list[tuple[int, int]]:
     """(index into ``trace.nodes``, sampled-token count) per trainable sampled
-    node, in the order ``assign_advantages`` walks."""
+    node, in the order of the trace's sampled-token stream."""
     selected = {id(node) for node in trainable_nodes(trace)}
     return [(index, sum(node.mask)) for index, node in enumerate(trace.nodes) if id(node) in selected]
+
+
+def branch_starts(trace: vf.Trace, turns: list[tuple[int, int]]) -> list[list[Any]]:
+    """Per training sample, ``[branch index, starts]``: the sampled-token-stream offset of
+    each sampled node that trains in it, in order, so where each of its ``token_layout``
+    runs starts in the stream."""
+    stream_start: dict[int, int] = {}
+    offset = 0
+    for index, length in turns:
+        stream_start[index] = offset
+        offset += length
+    node_index = {id(node): index for index, node in enumerate(trace.nodes)}
+    out: list[list[Any]] = []
+    for branch, mask in iter_trainable_branches(trace):
+        starts, offset = [], 0
+        for node in branch.nodes:
+            if np.any(mask[offset : offset + len(node.mask)]):
+                starts.append(stream_start[node_index[id(node)]])
+            offset += len(node.mask)
+        out.append([branch.index, starts])
+    return out
 
 
 def _finite(x: Any) -> bool:
@@ -192,73 +223,104 @@ def parse_stages(raw: Any, turns: list[tuple[int, int]], num_nodes: int) -> Pars
     return ParsedStages(names, boundaries, rewards, values, scores, pools)
 
 
-def stage_records(
-    traces: list[vf.Trace], stage_key: str, success_threshold: float
-) -> tuple[list[StageRecord], list[str]]:
+def stage_summary(trace: vf.Trace, stage_key: str) -> dict[str, Any]:
+    """What ``score_group`` needs of a trace's stage record, parsed against its message
+    graph in the env worker: the ``ParsedStages`` fields, the sampled-token count and the
+    ``branch_starts``; or the reason and detail of a record that can't be used."""
+    raw = trace.info.get(stage_key)
+    if raw is None:
+        return {"error": "missing_record", "detail": f"no record under info[{stage_key!r}]"}
+    turns = sampled_turns(trace)
+    try:
+        parsed = parse_stages(raw, turns, len(trace.nodes))
+    except StageRecordError as error:
+        # Carried to the orchestrator, where the whole group falls back.
+        return {"error": error.reason, "detail": str(error)}
+    return {
+        **parsed._asdict(),
+        "num_tokens": sum(length for _, length in turns),
+        "branches": branch_starts(trace, turns),
+    }
+
+
+def summarize_stages(episode: vf.Episode, stage_key: str) -> None:
+    """Leave every trainable trace's ``stage_summary`` for ``score_group``."""
+    for _, trace in iter_trainable_traces([episode]):
+        trace.info[ALGO_INFO_KEY] = stage_summary(trace, stage_key)
+
+
+def stage_records(traces: list[TraceHead], success_threshold: float) -> tuple[list[StageRecord], list[str]]:
     """Every trace's record plus the group's stage names. Raises
     ``StageRecordError`` when the group has no consistent stage record to
     credit by."""
     records: list[StageRecord] = []
     stage_names: list[str] | None = None
     for i, trace in enumerate(traces):
-        raw = trace.info.get(stage_key)
-        if raw is None:
-            raise StageRecordError("missing_record", f"rollout {i} has no record under info[{stage_key!r}]")
-        turns = sampled_turns(trace)
-        try:
-            parsed = parse_stages(raw, turns, len(trace.nodes))
-        except StageRecordError as error:
-            raise StageRecordError(error.reason, f"rollout {i}: {error}") from None
+        summary = trace.info.get(ALGO_INFO_KEY)
+        if summary is None:
+            raise StageRecordError("missing_record", f"rollout {i} carries no stage summary")
+        if "error" in summary:
+            raise StageRecordError(summary["error"], f"rollout {i}: {summary['detail']}")
+        names, boundaries = summary["names"], summary["boundaries"]
         if stage_names is None:
-            stage_names = parsed.names
-        elif parsed.names != stage_names:
+            stage_names = names
+        elif names != stage_names:
             raise StageRecordError(
-                "stage_lists_differ", f"rollout {i} lists stages {parsed.names}, rollout 0 lists {stage_names}"
+                "stage_lists_differ", f"rollout {i} lists stages {names}, rollout 0 lists {stage_names}"
             )
-        if trace.reward >= success_threshold and len(parsed.boundaries) < len(parsed.names):
+        if trace.reward >= success_threshold and len(boundaries) < len(names):
             raise StageRecordError(
                 "success_without_stages",
                 f"rollout {i} succeeded (reward {trace.reward}) after completing "
-                f"{len(parsed.boundaries)} of {len(parsed.names)} stages",
+                f"{len(boundaries)} of {len(names)} stages",
             )
-        num_tokens = sum(length for _, length in turns)
         records.append(
             StageRecord(
-                parsed.boundaries,
-                num_tokens,
+                boundaries,
+                summary["num_tokens"],
                 trace.reward,
-                parsed.rewards,
-                parsed.values,
-                parsed.scores,
-                parsed.pools,
+                summary["rewards"],
+                summary["values"],
+                summary["scores"],
+                summary["pools"],
             )
         )
     assert stage_names is not None
     return records, stage_names
 
 
-def record_fallback(traces: list[vf.Trace], reason: str | None, reasons: tuple[str, ...]) -> None:
+def assign_stage_credit(trace: TraceHead, values: list[float]) -> None:
+    """Credit each training sample of a trace with its slice of the trace's per-token
+    advantages, which run over its sampled-token stream."""
+    stream = np.asarray(values, dtype=np.float32)
+    layout = token_layout(trace)
+    for branch, starts in trace.info[ALGO_INFO_KEY]["branches"]:
+        runs = [stream[start : start + count] for start, count in zip(starts, layout[branch], strict=True)]
+        assign_advantages(trace, branch, np.concatenate(runs))
+
+
+def record_fallback(traces: list[TraceHead], reason: str | None, reasons: tuple[str, ...]) -> None:
     """Flag every trace with whether its group fell back to plain GRPO credit,
     and why. Each flag is recorded on every trace, 0 included, so its mean over
     traces is a rate."""
     metrics = {"temporal_grpo/fallback": float(reason is not None)}
     metrics |= {f"temporal_grpo/fallback/{name}": float(name == reason) for name in reasons}
     for trace in traces:
-        trace.record_metrics(metrics)
+        trace.metrics.update(metrics)
 
 
-def fall_back(traces: list[vf.Trace], error: StageRecordError, reasons: tuple[str, ...]) -> None:
+def fall_back(traces: list[TraceHead], error: StageRecordError, reasons: tuple[str, ...]) -> None:
     """Plain GRPO credit for a group whose stage records can't be used, logged and flagged."""
     get_logger().debug(f"temporal_grpo: plain GRPO credit for group ({error.reason}: {error})")
     record_fallback(traces, error.reason, reasons)
     grpo_credit(traces)
 
 
-def grpo_credit(traces: list[vf.Trace]) -> None:
+def grpo_credit(traces: list[TraceHead]) -> None:
     """Plain group-mean GRPO credit."""
     mean = sum(trace.reward for trace in traces) / len(traces)
     for trace in traces:
-        assign_advantages(trace, trace.reward - mean)
+        assign_advantage(trace, trace.reward - mean)
 
 
 def stage_advantages(
@@ -328,12 +390,15 @@ class TemporalGRPOAlgorithm(Algorithm):
         self.trajectory_weight = config.trajectory_weight
         self.success_threshold = config.success_threshold
 
-    async def score_group(self, episodes: list[vf.Episode]) -> None:
+    async def score_episode(self, episode: vf.Episode) -> None:
+        summarize_stages(episode, self.stage_key)
+
+    async def score_group(self, episodes: list[EpisodeHead]) -> None:
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         if not traces:
             return
         try:
-            records, stage_names = stage_records(traces, self.stage_key, self.success_threshold)
+            records, stage_names = stage_records(traces, self.success_threshold)
         except StageRecordError as error:
             return fall_back(traces, error, FALLBACK_REASONS)
         record_fallback(traces, None, FALLBACK_REASONS)
@@ -344,4 +409,4 @@ class TemporalGRPOAlgorithm(Algorithm):
             trajectory_weight=self.trajectory_weight,
         )
         for trace, values in zip(traces, per_token, strict=True):
-            assign_advantages(trace, values)
+            assign_stage_credit(trace, values)

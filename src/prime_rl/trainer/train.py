@@ -13,8 +13,14 @@ from pathlib import Path
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 from torch.profiler import profile, ProfilerActivity
-from prime_rl.trainer.ckpt import Progress, ckpt_output_dir, setup_ckpt_manager, setup_model_files
-from prime_rl.utils.pathing import get_ckpt_dir, get_step_path, is_checkpoint_step_dir, resolve_latest_ckpt_step
+from prime_rl.trainer.ckpt import Progress, setup_ckpt_manager, setup_model_files
+from prime_rl.utils.pathing import (
+    ckpt_output_dir,
+    get_ckpt_dir,
+    get_step_path,
+    is_checkpoint_step_dir,
+    resolve_latest_ckpt_step,
+)
 from prime_rl.configs.pretrain import PretrainConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.trainer import CheckpointConfig
@@ -438,7 +444,6 @@ def train(config: SFTConfig | PretrainConfig):
         weight_sender = setup_weight_sender(
             config.run_dir,
             config.weight_broadcast,
-            parallel_dims,
             config.model.lora,
             model_name=config.model.name,
         )
@@ -540,9 +545,10 @@ def train(config: SFTConfig | PretrainConfig):
             reshard_module(model)
 
         grad_norm: torch.Tensor | None = None
+        group_grad_norms: dict[str, torch.Tensor] = {}
         if config.optim.max_norm is not None:
             logger.debug(f"Clipping gradients with max norm {config.optim.max_norm}")
-            grad_norm = clip_grad_norm_(gradient_manager, model, config.optim.max_norm)
+            grad_norm, group_grad_norms = clip_grad_norm_(gradient_manager, model, config.optim.max_norm)
         # An async checkpoint must finish copying the state before the optimizer step mutates it
         ckpt_manager.wait_for_staging()
         logger.debug("Optimizer step")
@@ -553,7 +559,12 @@ def train(config: SFTConfig | PretrainConfig):
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
 
-        step_stats, norms = to_host(step_stats, {"grad_norm": grad_norm} if grad_norm is not None else {})
+        norms = (
+            {"grad_norm": grad_norm, **{f"grad_norm/{group}": norm for group, norm in group_grad_norms.items()}}
+            if grad_norm is not None
+            else {}
+        )
+        step_stats, norms = to_host(step_stats, norms)
         result = step_result(step_stats, parallel_dims)
         loss = result.loss_sum / step_stats["loss_tokens"].item() if step_stats["loss_tokens"] > 0 else 0.0
         grad_norm_value = norms["grad_norm"].item() if norms else None
@@ -602,7 +613,7 @@ def train(config: SFTConfig | PretrainConfig):
         mfu_6dn = perf_counter.get_step_mfu(
             perf_counter.flop_counter.flops_per_token_6dn * result.num_tokens, step_time
         )
-        peak_memory, non_torch_memory = get_peak_memory_across_ranks()
+        peak_memory, non_torch_memory, peak_allocated_memory = get_peak_memory_across_ranks()
         max_peak_memory = max(max_peak_memory, peak_memory)
 
         # Log step metrics
@@ -653,6 +664,7 @@ def train(config: SFTConfig | PretrainConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/peak_memory": peak_memory,
             "perf/non_torch_memory": non_torch_memory,
+            "perf/peak_allocated_memory": peak_allocated_memory,
             "perf/mfu": mfu,
             "perf/mfu_6dn": mfu_6dn,
             "step": progress.step,
@@ -666,6 +678,9 @@ def train(config: SFTConfig | PretrainConfig):
         }
         if grad_norm_value is not None:
             optim_metrics["optim/grad_norm"] = grad_norm_value
+        optim_metrics.update(
+            {f"optim/{key}": value.item() for key, value in norms.items() if key.startswith("grad_norm/")}
+        )
         asyncio.run(monitors.log(optim_metrics, step=progress.step))
 
         loss_log_metrics = {
