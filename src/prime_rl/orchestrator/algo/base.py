@@ -80,7 +80,8 @@ class Algorithm:
 
     async def score_episode(self, episode: vf.Episode) -> None:
         """Assign rollout-local, per-token annotations (loss weights) to the nodes of one
-        finalized episode, in the env worker that ran it."""
+        finalized episode, in the env worker that ran it. What :meth:`score_group` needs of a
+        trace beyond its head goes under ``trace.info[ALGO_INFO_KEY]``, which the head carries."""
 
     async def score_group(self, episodes: list[EpisodeHead]) -> None:
         """Credit a finalized cohort: one advantage (``assign_advantage``) and optionally one rl

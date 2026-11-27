@@ -21,6 +21,10 @@ ADVANTAGE_KEY = "advantage"
 RL_WEIGHT_KEY = "rl_weight"
 """``trace.info`` key of the trace's rl loss weight; unset means 1.0."""
 
+ALGO_INFO_KEY = "algo"
+"""``trace.info`` key of what an algorithm's ``score_episode`` leaves on a trace for its
+``score_group``: a JSON-serializable value the trace's head carries to the orchestrator."""
+
 
 def branch_token_advantages(trace: TraceHead) -> dict[int, np.ndarray] | None:
     """The advantages of a trace credited per token, by branch index: one per trainable token

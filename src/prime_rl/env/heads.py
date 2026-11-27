@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from verifiers.v1.trace import Error, RunInfo, Timing
 from verifiers.v1.types import Usage
 
+from prime_rl.orchestrator.credit import ALGO_INFO_KEY
 from prime_rl.transports.batch.types import PAYLOAD_INFO_KEY, UNLABELED
 
 MAX_ERROR_CHARS = 4000
@@ -54,7 +55,8 @@ class TraceHead(BaseModel):
     rewards: dict[str, vf.Reward | None] = Field(default_factory=dict)
     metrics: dict[str, float | None] = Field(default_factory=dict)
     info: dict[str, Any] = Field(default_factory=dict)
-    """prime-rl's entries of the trace's info: the references to its training samples, and the
+    """prime-rl's entries of the trace's info: the references to its training samples, what
+    its algorithm's ``score_episode`` left for ``score_group`` (``ALGO_INFO_KEY``), and the
     credit the orchestrator assigns."""
     ok: bool = False
     is_completed: bool = False
@@ -191,7 +193,7 @@ def trace_head(trace: vf.Trace) -> TraceHead:
     trainable = trainable_nodes(trace)
     on_trainable_branch = {id(node): node for branch in trace.branches if branch.trainable for node in branch.nodes}
     output, input, subagent_output, subagent_input = length_penalty_tokens(trace)
-    info = {PAYLOAD_INFO_KEY: trace.info[PAYLOAD_INFO_KEY]} if PAYLOAD_INFO_KEY in trace.info else {}
+    info = {key: trace.info[key] for key in (PAYLOAD_INFO_KEY, ALGO_INFO_KEY) if key in trace.info}
     return TraceHead(
         id=trace.id,
         task=task_head(trace.task),

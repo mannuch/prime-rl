@@ -1,8 +1,22 @@
 """Stage-conditioned credit (Temporal GRPO, arXiv:2608.13026)."""
 
-import pytest
+import asyncio
+from unittest.mock import MagicMock
 
-from prime_rl.orchestrator.algo.temporal_grpo import StageRecord, StageRecordError, parse_stages, stage_advantages
+import pytest
+import verifiers.v1 as vf
+from verifiers.v1.types import AssistantMessage, UserMessage
+
+from prime_rl.configs.algorithm import TemporalGRPOAlgoConfig
+from prime_rl.orchestrator.algo.temporal_grpo import (
+    StageRecord,
+    StageRecordError,
+    TemporalGRPOAlgorithm,
+    parse_stages,
+    stage_advantages,
+)
+from tests.unit.orchestrator.test_algorithms import _node
+from tests.unit.orchestrator.test_train_sink import received, train_trace, whole_episode
 
 
 def spans(values):
@@ -110,3 +124,52 @@ def test_trajectory_blend():
     records = [StageRecord([5], 10, 0.0), StageRecord([], 10, 0.0)]
     adv = stage_advantages(records, 1, trajectory_weight=0.5)
     assert spans(adv[0]) == [(0.25, 5), (0.0, 5)]
+
+
+def _forked_trace(stages):
+    """A shared answer A (tokens 2, 3), then a fork into B1 (4, 5) and B2 (6)."""
+    nodes = [
+        _node(UserMessage(content="U"), parent=None, sampled=False, token_ids=[1]),
+        _node(AssistantMessage(content="A"), parent=0, sampled=True, token_ids=[2, 3]),
+        _node(AssistantMessage(content="B1"), parent=1, sampled=True, token_ids=[4, 5]),
+        _node(AssistantMessage(content="B2"), parent=1, sampled=True, token_ids=[6]),
+    ]
+    trace = vf.Trace(
+        task=vf.TraceTask(type="Task", data=vf.TaskData(idx=0, prompt=None)),
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        nodes=nodes,
+        rewards={},
+        ok=True,
+    )
+    trace.info["stages"] = stages
+    return trace
+
+
+def test_stage_credit_reaches_each_branch():
+    """The env worker parses the record against the graph; the orchestrator credits each
+    branch's slice of the sampled-token stream, the shared answer training in the first
+    branch only."""
+    algorithm = TemporalGRPOAlgorithm(TemporalGRPOAlgoConfig(), MagicMock())
+    traces = [_forked_trace([{"name": "a", "node": 1}]), _forked_trace([{"name": "a", "node": None}])]
+    episodes = [whole_episode([trace]) for trace in traces]
+    for episode in episodes:
+        asyncio.run(algorithm.score_episode(episode))
+    heads = [received(episode) for episode in episodes]
+    asyncio.run(algorithm.score_group(heads))
+
+    [b1, b2] = (
+        next(b.index for b in traces[0].branches if b.nodes[-1].message.content == leaf) for leaf in ("B1", "B2")
+    )
+    credited = [
+        {
+            (sample.branch_index, int(token_id)): float(advantage)
+            for sample in train_trace(head.traces[0])
+            for token_id, trainable, advantage in zip(sample.token_ids, sample.mask, sample.advantages, strict=True)
+            if trainable
+        }
+        for head in heads
+    ]
+    # Completing stage "a" earns +0.5 on A; the final stage has one entrant, so no signal.
+    assert credited[0] == {(b1, 2): 0.5, (b1, 3): 0.5, (b1, 4): 0.0, (b1, 5): 0.0, (b2, 6): 0.0}
+    assert credited[1] == {(b1, 2): -0.5, (b1, 3): -0.5, (b1, 4): -0.5, (b1, 5): -0.5, (b2, 6): -0.5}
+    assert all(head.traces[0].metrics["temporal_grpo/fallback"] == 0.0 for head in heads)
